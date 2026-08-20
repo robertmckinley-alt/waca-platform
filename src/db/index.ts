@@ -22,12 +22,28 @@ if (typeof window !== "undefined") {
   );
 }
 
-const connectionString = process.env.DATABASE_URL;
-
-if (!connectionString) {
-  throw new Error(
-    "DATABASE_URL is not set. Copy .env.example to .env.local and fill it in.",
-  );
+/**
+ * DATABASE_URL is read lazily, NOT at module evaluation.
+ *
+ * Next.js imports every route module during `next build` to collect its
+ * configuration, long before any request is served. Throwing here meant a
+ * deploy without DATABASE_URL failed the *build* with
+ * "Failed to collect configuration for /admin/finances/invoices/[id]", which
+ * points at a random page rather than the actual problem. The connection is
+ * now opened on first query, so the build succeeds and a missing DATABASE_URL
+ * surfaces at request time with a message that says what to do.
+ */
+function requireConnectionString(): string {
+  const value = process.env.DATABASE_URL;
+  if (!value) {
+    throw new Error(
+      "DATABASE_URL is not set. Locally: copy .env.example to .env.local and " +
+        "fill it in. On Vercel: add DATABASE_URL under Project Settings > " +
+        "Environment Variables, or attach a Postgres store under Storage, " +
+        "then redeploy.",
+    );
+  }
+  return value;
 }
 
 declare global {
@@ -36,7 +52,7 @@ declare global {
 }
 
 function createClient() {
-  return postgres(connectionString!, {
+  return postgres(requireConnectionString(), {
     // Supabase's pooler caps prepared statements; keep this off so the same
     // code works against both the direct connection and pgbouncer.
     prepare: false,
@@ -46,19 +62,78 @@ function createClient() {
   });
 }
 
-export const pgClient = globalThis.__wacaPgClient ?? createClient();
+let cachedClient: ReturnType<typeof postgres> | undefined;
 
-if (process.env.NODE_ENV !== "production") {
-  globalThis.__wacaPgClient = pgClient;
+/** Opens (or reuses) the pooled connection. First call requires DATABASE_URL. */
+export function getPgClient(): ReturnType<typeof postgres> {
+  if (globalThis.__wacaPgClient) return globalThis.__wacaPgClient;
+  if (!cachedClient) {
+    cachedClient = createClient();
+    if (process.env.NODE_ENV !== "production") {
+      globalThis.__wacaPgClient = cachedClient;
+    }
+  }
+  return cachedClient;
 }
 
-export const db = drizzle(pgClient, {
-  schema,
-  casing: "snake_case",
-  logger: process.env.DRIZZLE_LOG === "true",
+let cachedDb: ReturnType<typeof drizzle<typeof schema>> | undefined;
+
+function getDb() {
+  if (!cachedDb) {
+    cachedDb = drizzle(getPgClient(), {
+      schema,
+      casing: "snake_case",
+      logger: process.env.DRIZZLE_LOG === "true",
+    });
+  }
+  return cachedDb;
+}
+
+/**
+ * Lazy proxy so `import { db } from "@/db"` never opens a socket at import
+ * time. Every property access forwards to the real Drizzle client, which is
+ * constructed on first use.
+ */
+export const db = new Proxy({} as ReturnType<typeof drizzle<typeof schema>>, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getDb() as object, prop, receiver);
+  },
+  has(_target, prop) {
+    return Reflect.has(getDb() as object, prop);
+  },
+  /**
+   * Drizzle's `is()` — which Auth.js's DrizzleAdapter uses to detect the
+   * dialect — walks the prototype chain looking for a static entityKind.
+   * Without this trap the proxy reports Object.prototype and the adapter
+   * fails with "Unsupported database type (object)".
+   */
+  getPrototypeOf() {
+    return Reflect.getPrototypeOf(getDb() as object);
+  },
+  ownKeys() {
+    return Reflect.ownKeys(getDb() as object);
+  },
+  getOwnPropertyDescriptor(_target, prop) {
+    const d = Reflect.getOwnPropertyDescriptor(getDb() as object, prop);
+    return d ? { ...d, configurable: true } : undefined;
+  },
 });
 
-export type Database = typeof db;
+/** Back-compat: the pooled client, opened on first access. */
+export const pgClient = new Proxy({} as ReturnType<typeof postgres>, {
+  get(_target, prop, receiver) {
+    return Reflect.get(getPgClient() as object, prop, receiver);
+  },
+  apply(_target, thisArg, args: unknown[]) {
+    const client = getPgClient() as unknown as (
+      this: unknown,
+      ...a: unknown[]
+    ) => unknown;
+    return client.apply(thisArg, args);
+  },
+}) as ReturnType<typeof postgres>;
+
+export type Database = ReturnType<typeof drizzle<typeof schema>>;
 export type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 /** Accepts either the pooled client or an open transaction. */
 export type DbExecutor = Database | Transaction;
