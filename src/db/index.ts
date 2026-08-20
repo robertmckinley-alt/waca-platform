@@ -35,15 +35,31 @@ if (typeof window !== "undefined") {
  */
 function requireConnectionString(): string {
   const value = process.env.DATABASE_URL;
-  if (!value) {
-    throw new Error(
-      "DATABASE_URL is not set. Locally: copy .env.example to .env.local and " +
-        "fill it in. On Vercel: add DATABASE_URL under Project Settings > " +
-        "Environment Variables, or attach a Postgres store under Storage, " +
-        "then redeploy.",
-    );
+  if (value) return value;
+
+  // `next build` imports every route module to collect its configuration, and
+  // src/auth.ts hands this client to DrizzleAdapter at module scope — so the
+  // whole module graph is evaluated before a single request exists. On Vercel
+  // a variable marked **Sensitive** is deliberately withheld from the build
+  // environment and only injected at runtime, so DATABASE_URL is legitimately
+  // absent here even on a correctly configured project. Throwing failed the
+  // deploy with an error naming whichever route Next happened to collect
+  // first.
+  //
+  // postgres() does not open a socket at construction, so a placeholder DSN
+  // lets the graph build. Nothing queries during a build; if anything ever
+  // did, it would fail loudly against 127.0.0.1 rather than silently reading
+  // the wrong database.
+  if (process.env.NEXT_PHASE === "phase-production-build") {
+    return "postgres://build:build@127.0.0.1:5432/build";
   }
-  return value;
+
+  throw new Error(
+    "DATABASE_URL is not set. Locally: copy .env.example to .env.local and " +
+      "fill it in. On Vercel: add DATABASE_URL under Project Settings > " +
+      "Environment Variables, or attach a Postgres store under Storage, " +
+      "then redeploy.",
+  );
 }
 
 declare global {
