@@ -71,8 +71,22 @@ export default async function AdminLayout({
       ],
     },
     {
+      title: "Communications",
+      items: [{ href: "/admin/email", label: "Email" }],
+    },
+    {
       title: "Money",
       items: [{ href: "/admin/finances", label: "Finances" }],
+    },
+    {
+      /**
+       * One item, not three. The media library and the publish queue are tabs
+       * on this section's own pages -- the same rule the rest of this nav
+       * follows, and the reason "Content", "Media" and "Publish" would
+       * otherwise all light up at once (they share a path prefix).
+       */
+      title: "Public site",
+      items: [{ href: "/admin/content", label: "Content" }],
     },
     {
       title: "System",

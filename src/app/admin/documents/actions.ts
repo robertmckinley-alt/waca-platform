@@ -1,4 +1,5 @@
 "use server";
+import { slugify as sharedSlugify } from "@/lib/slug";
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
@@ -32,13 +33,8 @@ import { putDocumentObject, storageIsConfigured } from "@/lib/documents/storage"
  * ==========================================================================
  */
 
-const slugify = (s: string) =>
-  s
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
+/** THE slugifier, capped at the documents table's slug length. */
+const slugify = (value: string) => sharedSlugify(value, 80);
 
 const csvList = z
   .string()

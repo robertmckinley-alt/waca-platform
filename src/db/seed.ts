@@ -31,9 +31,11 @@ config({ path: ".env.local", quiet: true });
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import { scryptSync, randomBytes } from "node:crypto";
+import { createHash, scryptSync, randomBytes } from "node:crypto";
 
 import * as s from "./schema";
+import { slugify as sharedSlugify } from "@/lib/slug";
+import { renderCampaign } from "@/lib/email/campaign/render";
 
 /** Surfaced by the UI so nobody mistakes seed rows for production records. */
 export const IS_DEMO_DATA = true;
@@ -82,12 +84,8 @@ const addYears = (d: Date, n: number) => {
   return x;
 };
 
-function slugify(v: string) {
-  return v
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-}
+/** THE slugifier. The seed does not get its own. */
+const slugify = (v: string) => sharedSlugify(v);
 
 /* ============================================================ vocabulary */
 
@@ -370,6 +368,12 @@ async function main() {
   /* ---------------------------------------------------------- truncate */
   await db.execute(sql`
     TRUNCATE TABLE
+      email_events, campaign_recipients, campaigns,
+      unsubscribe_tokens, suppressions,
+      email_templates, audience_members, audiences,
+      content_publishes, content_assets,
+      content_revision_sequences, content_revisions, content_items,
+      content_types,
       audit_log, document_downloads, documents,
       payment_allocations, refunds, payments, invoice_lines, invoices,
       event_sponsorships, registrations, sponsor_tiers, ticket_types,
@@ -1850,6 +1854,1418 @@ async function main() {
   if (reminderLogInserts.length)
     await db.insert(s.renewalReminders).values(reminderLogInserts);
 
+
+  /* ==================================================================== *
+   *  CONTENT  --  the CMS mirror of the public site.
+   *
+   *  Page titles and slugs mirror waca-web's real information architecture,
+   *  because that is what the CMS has to be able to edit. Everything with a
+   *  byline, a quote or a person's name in it is INVENTED, exactly like the
+   *  rest of this file: no real press headline, outlet, trustee or member of
+   *  staff appears here.
+   * ==================================================================== */
+
+  const adminUser = userRows[0];
+  const staffUser = userRows[1];
+
+  const typeSeeds: {
+    key: (typeof s.contentTypeKeyEnum.enumValues)[number];
+    label: string;
+    labelPlural: string;
+    description: string;
+    routePattern: string | null;
+    astroTarget: string | null;
+    isSingleton?: boolean;
+    allowsCreate?: boolean;
+    fields: s.ContentFieldDef[];
+  }[] = [
+    {
+      key: "page",
+      label: "Page",
+      labelPlural: "Pages",
+      description: "A standing page in the site's navigation.",
+      routePattern: "/:slug",
+      astroTarget: "src/pages",
+      fields: [
+        { name: "path", label: "URL path", type: "text", required: true, sidebar: true, help: "e.g. /about/leadership" },
+        { name: "lede", label: "Lede", type: "textarea", required: true },
+        { name: "body", label: "Body", type: "markdown", required: true },
+        { name: "heroImage", label: "Hero image", type: "image", altTextRequired: true },
+        { name: "metaDescription", label: "Meta description", type: "textarea", sidebar: true, max: 160 },
+      ],
+    },
+    {
+      key: "press",
+      label: "Press item",
+      labelPlural: "Press coverage",
+      description: "Coverage of WACA, and WACA's own releases and statements.",
+      routePattern: "/media/press/:slug",
+      astroTarget: "press",
+      fields: [
+        { name: "headline", label: "Headline", type: "text", required: true },
+        { name: "date", label: "Date", type: "date", required: true, sidebar: true },
+        { name: "outlet", label: "Outlet", type: "text" },
+        { name: "url", label: "Link to coverage", type: "url" },
+        { name: "kind", label: "Kind", type: "select", required: true, sidebar: true, options: [
+          { value: "article", label: "Article" },
+          { value: "broadcast", label: "Broadcast" },
+          { value: "op-ed", label: "Op-ed" },
+          { value: "release", label: "Release" },
+          { value: "statement", label: "Statement" },
+        ] },
+        { name: "topics", label: "Topics", type: "multiselect", options: [
+          { value: "banking", label: "Banking" },
+          { value: "federal", label: "Federal" },
+          { value: "hemp-thc", label: "Hemp and THC" },
+          { value: "labor", label: "Labor" },
+          { value: "licensing", label: "Licensing" },
+          { value: "public-health", label: "Public health" },
+          { value: "rulemaking", label: "Rulemaking" },
+          { value: "social-equity", label: "Social equity" },
+          { value: "taxation", label: "Taxation" },
+          { value: "testimony", label: "Testimony" },
+          { value: "youth-access", label: "Youth access" },
+        ] },
+        { name: "featured", label: "Featured", type: "boolean", sidebar: true },
+      ],
+    },
+    {
+      key: "record",
+      label: "Advocacy record",
+      labelPlural: "Advocacy record",
+      description: "Testimony, comment letters, coalition letters, reports.",
+      routePattern: "/policy/record/:slug",
+      astroTarget: "records",
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "date", label: "Date", type: "date", required: true, sidebar: true },
+        { name: "type", label: "Type", type: "select", required: true, sidebar: true, options: [
+          { value: "comment-letter", label: "Comment letter" },
+          { value: "coalition-letter", label: "Coalition letter" },
+          { value: "position", label: "Position" },
+          { value: "report", label: "Report" },
+          { value: "testimony", label: "Testimony" },
+        ] },
+        { name: "document", label: "Document", type: "asset" },
+        { name: "billNumber", label: "Bill number", type: "text", sidebar: true },
+        { name: "session", label: "Legislative session", type: "text", sidebar: true },
+        { name: "body", label: "Summary", type: "markdown" },
+      ],
+    },
+    {
+      key: "agenda",
+      label: "Agenda",
+      labelPlural: "Legislative agendas",
+      description: "The annual legislative and regulatory agenda.",
+      routePattern: "/policy/agenda-archive/:slug",
+      astroTarget: "agendas",
+      fields: [
+        { name: "year", label: "Year", type: "number", required: true, sidebar: true },
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "documents", label: "Documents", type: "array", fields: [
+          { name: "label", label: "Label", type: "text", required: true },
+          { name: "source", label: "File", type: "asset", required: true },
+        ] },
+        { name: "body", label: "Body", type: "markdown" },
+      ],
+    },
+    {
+      key: "post",
+      label: "Post",
+      labelPlural: "Blog",
+      description: "Association news and member updates.",
+      routePattern: "/media/blog/:slug",
+      astroTarget: "posts",
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "date", label: "Date", type: "date", required: true, sidebar: true },
+        { name: "author", label: "Author", type: "text", sidebar: true },
+        { name: "body", label: "Body", type: "markdown", required: true },
+        { name: "image", label: "Image", type: "image", altTextRequired: true },
+      ],
+    },
+    {
+      key: "person",
+      label: "Person",
+      labelPlural: "Board and staff",
+      description: "Trustees and staff shown on the leadership page.",
+      routePattern: "/about/leadership#:slug",
+      astroTarget: "people",
+      fields: [
+        { name: "name", label: "Name", type: "text", required: true },
+        { name: "role", label: "Role", type: "text", required: true },
+        { name: "org", label: "Organisation", type: "text" },
+        { name: "group", label: "Group", type: "select", required: true, sidebar: true, options: [
+          { value: "board", label: "Board" },
+          { value: "staff", label: "Staff" },
+        ] },
+        { name: "boardOffice", label: "Board office", type: "select", sidebar: true, options: [
+          { value: "president", label: "President" },
+          { value: "vice-president", label: "Vice president" },
+          { value: "treasurer", label: "Treasurer" },
+          { value: "secretary", label: "Secretary" },
+          { value: "trustee", label: "Trustee" },
+        ] },
+        { name: "headshot", label: "Headshot", type: "image", altTextRequired: true },
+        { name: "bio", label: "Biography", type: "markdown" },
+      ],
+    },
+    {
+      key: "member",
+      label: "Member listing",
+      labelPlural: "Member directory",
+      description:
+        "Public directory entry. Derived from the membership tables by the directory sync; editors may amend the blurb but not create a listing.",
+      routePattern: "/members#:slug",
+      astroTarget: "members",
+      allowsCreate: false,
+      fields: [
+        { name: "name", label: "Name", type: "text", required: true },
+        { name: "category", label: "Category", type: "select", required: true, sidebar: true, options: [
+          { value: "retailer", label: "Retailer" },
+          { value: "producer-processor", label: "Producer / processor" },
+          { value: "lab-transport", label: "Lab / transport" },
+          { value: "ancillary", label: "Ancillary" },
+        ] },
+        { name: "url", label: "Website", type: "url" },
+        { name: "logo", label: "Logo", type: "image", altTextRequired: true },
+        { name: "consentPublicListing", label: "Consents to a public listing", type: "boolean", required: true, sidebar: true },
+      ],
+    },
+    {
+      key: "stat",
+      label: "Statistic",
+      labelPlural: "Statistics",
+      description:
+        "A figure the site is allowed to publish, with its source. No figure renders without one.",
+      routePattern: null,
+      astroTarget: "src/data/stats.yaml",
+      fields: [
+        { name: "value", label: "Value", type: "text", required: true },
+        { name: "label", label: "Label", type: "text", required: true },
+        { name: "sourceId", label: "Source id", type: "text", required: true, sidebar: true },
+        { name: "sourceTitle", label: "Source title", type: "text", required: true },
+        { name: "sourceUrl", label: "Source URL", type: "url" },
+        { name: "asOf", label: "As of", type: "date", sidebar: true },
+      ],
+    },
+    {
+      key: "nav",
+      label: "Navigation",
+      labelPlural: "Navigation",
+      description: "The primary and footer navigation trees.",
+      routePattern: null,
+      astroTarget: "src/data/nav.yaml",
+      isSingleton: true,
+      allowsCreate: false,
+      fields: [
+        { name: "primary", label: "Primary navigation", type: "array", fields: [
+          { name: "label", label: "Label", type: "text", required: true },
+          { name: "href", label: "Href", type: "text", required: true },
+        ] },
+        { name: "footer", label: "Footer navigation", type: "array", fields: [
+          { name: "label", label: "Label", type: "text", required: true },
+          { name: "href", label: "Href", type: "text", required: true },
+        ] },
+      ],
+    },
+    {
+      key: "setting",
+      label: "Setting",
+      labelPlural: "Site settings",
+      description: "Site-wide identity and contact facts.",
+      routePattern: null,
+      astroTarget: "src/data/site.yaml",
+      allowsCreate: false,
+      fields: [
+        { name: "value", label: "Value", type: "text", required: true },
+        { name: "note", label: "Note", type: "textarea" },
+      ],
+    },
+  ];
+
+  const contentTypeRows = typeSeeds.map((t, i) => ({
+    id: uid(),
+    key: t.key,
+    label: t.label,
+    labelPlural: t.labelPlural,
+    description: t.description,
+    fields: t.fields,
+    routePattern: t.routePattern,
+    astroTarget: t.astroTarget,
+    isSingleton: t.isSingleton ?? false,
+    allowsCreate: t.allowsCreate ?? true,
+    sortOrder: i,
+  }));
+  await db.insert(s.contentTypes).values(contentTypeRows);
+
+  /* ------------------------------------------------------ content items */
+
+  type ContentStatus = (typeof s.contentStatusEnum.enumValues)[number];
+  type ItemSeed = {
+    type: (typeof s.contentTypeKeyEnum.enumValues)[number];
+    slug: string;
+    title: string;
+    status: ContentStatus;
+    data: Record<string, unknown>;
+    excerpt?: string;
+    sortOrder?: number;
+    publishAt?: Date | null;
+    /** How many revisions to write before the current one. */
+    priorRevisions?: number;
+  };
+
+  const itemSeeds: ItemSeed[] = [];
+
+  // --- pages: the site's real IA. Slug is flat (the CHECK forbids "/"),
+  //     the URL path travels in data.path.
+  const PAGES: [string, string, string, string][] = [
+    ["home", "/", "Washington CannaBusiness Association", "The trade association for Washington's licensed cannabis businesses."],
+    ["about", "/about", "Who We Are", "WACA represents licensed cannabis businesses before the Legislature and the Liquor and Cannabis Board."],
+    ["about-leadership", "/about/leadership", "Board and Staff", "The trustees and staff who run the association."],
+    ["about-democratic-process", "/about/democratic-process", "How WACA Decides", "Sector councils propose, the board disposes, the membership ratifies."],
+    ["about-sector-councils", "/about/sector-councils", "Sector Councils", "Four councils, one per licence type, each with a seat at the policy table."],
+    ["about-documents", "/about/documents", "Governing Documents", "Bylaws, code of conduct, and the refund policy."],
+    ["policy", "/policy", "Policy", "What WACA is working on this session."],
+    ["policy-agenda", "/policy/agenda", "Legislative and Regulatory Agenda", "The agenda the membership ratified for the coming session."],
+    ["policy-agenda-archive", "/policy/agenda-archive", "Agenda Archive, 2015 to Today", "Every agenda WACA has adopted since incorporation."],
+    ["policy-record", "/policy/record", "Advocacy Record", "Testimony, comment letters and coalition letters, in full."],
+    ["policy-social-equity", "/policy/social-equity", "Social Equity", "WACA's position on the social equity programme."],
+    ["members", "/members", "Members", "The organisations that make up the association."],
+    ["membership", "/membership", "Membership", "Levels, fees, and how to join."],
+    ["events", "/events", "Events", "Meetings, conferences and Day on the Hill."],
+    ["contact", "/contact", "Contact", "How to reach the association."],
+    ["ai-disclosure", "/ai-disclosure", "AI Disclosure", "Where machine assistance was used on this site, and where it was not."],
+  ];
+  PAGES.forEach(([slug, path, title, lede], i) => {
+    itemSeeds.push({
+      type: "page",
+      slug,
+      title,
+      status: "published",
+      sortOrder: i,
+      excerpt: lede,
+      priorRevisions: int(1, 4),
+      data: {
+        path,
+        lede,
+        body: `## ${title}\n\n${lede}\n\nThis body is synthetic seed copy standing in for the page WACA staff will edit here.`,
+        metaDescription: lede.slice(0, 155),
+      },
+    });
+  });
+  // Two pages in flight, so the editor has something that is not live.
+  itemSeeds.push({
+    type: "page",
+    slug: "about-annual-report",
+    title: "Annual Report",
+    status: "draft",
+    sortOrder: 20,
+    excerpt: "Draft: the 2026 annual report landing page.",
+    priorRevisions: 2,
+    data: { path: "/about/annual-report", lede: "Draft.", body: "Not finished." },
+  });
+  itemSeeds.push({
+    type: "page",
+    slug: "policy-2027-session-preview",
+    title: "2027 Session Preview",
+    status: "in_review",
+    sortOrder: 21,
+    excerpt: "Awaiting a read from the policy committee before it goes live.",
+    priorRevisions: 3,
+    data: {
+      path: "/policy/2027-session-preview",
+      lede: "What the 2027 session is likely to bring.",
+      body: "Draft for committee review.",
+    },
+  });
+
+  // --- press
+  const PRESS_TOPICS = ["banking", "federal", "hemp-thc", "labor", "licensing", "public-health", "rulemaking", "social-equity", "taxation", "testimony", "youth-access"];
+  const PRESS_OUTLETS = ["Cascade Business Journal", "Puget Sound Wire", "Evergreen Policy Review", "Olympia Dispatch", "Northwest Trade Weekly"];
+  const PRESS_HEADLINES = [
+    "Trade group backs excise tax restructuring ahead of session",
+    "Licensed operators press regulators on testing standards",
+    "Association testifies on transport rule rewrite",
+    "Statement on the interim hemp-derived THC policy",
+    "Retailers seek clarity on signage limits",
+    "Producers welcome canopy reporting simplification",
+    "Association comments on the social equity applicant window",
+    "Board elects new officers for the coming term",
+    "Labs raise accreditation timeline with the board",
+    "Statement on the youth-access enforcement report",
+    "Members brief lawmakers at Day on the Hill",
+    "Association responds to the banking access proposal",
+  ];
+  PRESS_HEADLINES.forEach((headline, i) => {
+    const daysAgo = 20 + i * 26 + int(0, 12);
+    const status: ContentStatus =
+      i === 0 ? "scheduled" : i === 1 ? "in_review" : "published";
+    itemSeeds.push({
+      type: "press",
+      slug: slugify(headline).slice(0, 70),
+      title: headline,
+      status,
+      sortOrder: i,
+      excerpt: `${headline}.`,
+      priorRevisions: int(0, 2),
+      publishAt: status === "scheduled" ? addDays(TODAY, int(3, 20)) : null,
+      data: {
+        headline,
+        date: iso(addDays(TODAY, -daysAgo)),
+        outlet: pick(PRESS_OUTLETS),
+        url: `https://example.org/coverage/${slugify(headline).slice(0, 40)}`,
+        kind: pick(["article", "op-ed", "release", "statement"]),
+        topics: [pick(PRESS_TOPICS), pick(PRESS_TOPICS)],
+        featured: i < 3,
+      },
+    });
+  });
+
+  // --- advocacy record
+  const RECORDS: [string, string, string][] = [
+    ["Comment letter on transport manifest rulemaking", "comment-letter", "WAC 314-55"],
+    ["Testimony on the excise tax restructuring bill", "testimony", "HB 1042"],
+    ["Coalition letter on hemp-derived THC", "coalition-letter", "SB 5367"],
+    ["Position on laboratory accreditation authority", "position", "SB 5376"],
+    ["Comment letter on retail signage limits", "comment-letter", "WAC 314-55-155"],
+    ["Report: the licensed market five years on", "report", ""],
+    ["Testimony on licensee safety and robbery response", "testimony", "HB 1749"],
+  ];
+  RECORDS.forEach(([title, type, bill], i) => {
+    itemSeeds.push({
+      type: "record",
+      slug: slugify(title).slice(0, 70),
+      title,
+      status: i === RECORDS.length - 1 ? "draft" : "published",
+      sortOrder: i,
+      excerpt: title,
+      priorRevisions: int(0, 3),
+      data: {
+        title,
+        date: iso(addDays(TODAY, -(40 + i * 70))),
+        type,
+        billNumber: bill || undefined,
+        session: bill ? `${TODAY.getUTCFullYear() - (i % 3)} Regular Session` : undefined,
+        body: `Synthetic summary of ${title.toLowerCase()}.`,
+      },
+    });
+  });
+
+  // --- agendas
+  for (let y = 2023; y <= 2026; y++) {
+    itemSeeds.push({
+      type: "agenda",
+      slug: String(y),
+      title: `${y} Legislative and Regulatory Agenda`,
+      status: "published",
+      sortOrder: 2100 - y,
+      excerpt: `The agenda the membership ratified for the ${y} session.`,
+      priorRevisions: int(1, 3),
+      data: {
+        year: y,
+        title: `${y} Legislative and Regulatory Agenda`,
+        documents: [{ label: `${y} agenda (PDF)`, source: `docs/agenda-${y}.pdf` }],
+        body: `Priorities adopted for the ${y} session.`,
+      },
+    });
+  }
+  itemSeeds.push({
+    type: "agenda",
+    slug: "2027",
+    title: "2027 Legislative and Regulatory Agenda",
+    status: "scheduled",
+    sortOrder: 73,
+    excerpt: "Ratified by the membership; goes live the morning of the policy meeting.",
+    priorRevisions: 2,
+    publishAt: addDays(TODAY, 34),
+    data: { year: 2027, title: "2027 Legislative and Regulatory Agenda", documents: [], body: "Embargoed." },
+  });
+
+  // --- posts
+  const POSTS = [
+    "Welcome to the rebuilt member portal",
+    "What the interim rules mean for producers",
+    "Sector council recommendations are open for comment",
+    "Registration is open for the spring meeting",
+    "A short guide to reading the Detail Report",
+    "How the annual agenda gets written",
+  ];
+  POSTS.forEach((title, i) => {
+    itemSeeds.push({
+      type: "post",
+      slug: slugify(title).slice(0, 70),
+      title,
+      status: i === POSTS.length - 1 ? "draft" : "published",
+      sortOrder: i,
+      excerpt: title,
+      priorRevisions: int(0, 2),
+      data: {
+        title,
+        date: iso(addDays(TODAY, -(15 + i * 45))),
+        author: i % 2 === 0 ? adminUser.name : staffUser.name,
+        body: `Synthetic post body for "${title}".`,
+      },
+    });
+  });
+
+  // --- people (invented, like every other person in this file)
+  const PEOPLE: [string, string, string, "board" | "staff", string | null][] = [
+    ["Dana Whitfield", "Executive Director", "WACA", "staff", null],
+    ["Rowan Petrakis", "Membership Manager", "WACA", "staff", null],
+    ["Imani Castellanos", "Policy Director", "WACA", "staff", null],
+    ["Teodora Lindqvist", "President", "Fernbrook Retail", "board", "president"],
+    ["Marcus Ballenger", "Vice President", "Harrow Creek Growers", "board", "vice-president"],
+    ["Priya Ravensworth", "Treasurer", "Northlight Labs", "board", "treasurer"],
+    ["Silas Okonkwo", "Secretary", "Cedar Row Transport", "board", "secretary"],
+    ["Nadia Brightwater", "Retail Representative", "Alder Street Cannabis", "board", "trustee"],
+    ["Emeka Solheim", "Producer Representative", "Quarry Bend Farms", "board", "trustee"],
+    ["Rosalind Achebe", "Ancillary Representative", "Kestrel Compliance", "board", "trustee"],
+  ];
+  PEOPLE.forEach(([name, role, org, group, office], i) => {
+    itemSeeds.push({
+      type: "person",
+      slug: slugify(name),
+      title: name,
+      status: "published",
+      sortOrder: i,
+      excerpt: `${role}, ${org}`,
+      priorRevisions: int(0, 2),
+      data: {
+        name,
+        role,
+        org,
+        group,
+        boardOffice: office ?? undefined,
+        bio: `${name} is a synthetic seed record standing in for a real trustee or member of staff.`,
+      },
+    });
+  });
+
+  // --- member directory listings, derived from the organisations above
+  orgInserts
+    .filter((o) => o.publicListingConsent)
+    .forEach((o, i) => {
+      itemSeeds.push({
+        type: "member",
+        slug: o.slug as string,
+        title: o.displayName as string,
+        status: "published",
+        sortOrder: i,
+        excerpt: `${o.displayName} — ${o.category}`,
+        priorRevisions: 0,
+        data: {
+          name: o.displayName,
+          category: o.category,
+          url: o.website ?? undefined,
+          consentPublicListing: true,
+        },
+      });
+    });
+
+  // --- stats. Every figure carries its source, or it does not render.
+  const STATS: [string, string, string, string][] = [
+    ["54", "member organisations", "waca-membership-2026", "WACA membership records, August 2026"],
+    ["2014", "founded", "waca-bylaws", "WACA bylaws, article I"],
+    ["4", "sector councils", "waca-council-charter", "Sector council charter, 2023"],
+    ["12", "annual agendas published", "waca-agenda-archive", "WACA agenda archive"],
+    ["78", "documents in the advocacy record", "waca-record-index", "WACA advocacy record index"],
+    ["253", "press entries since 2014", "waca-press-index", "WACA press index"],
+  ];
+  STATS.forEach(([value, label, sourceId, sourceTitle], i) => {
+    itemSeeds.push({
+      type: "stat",
+      slug: slugify(label),
+      title: `${value} ${label}`,
+      status: "published",
+      sortOrder: i,
+      excerpt: sourceTitle,
+      priorRevisions: 0,
+      data: { value, label, sourceId, sourceTitle, asOf: iso(TODAY) },
+    });
+  });
+
+  // --- nav (singleton) and settings
+  itemSeeds.push({
+    type: "nav",
+    slug: "primary",
+    title: "Site navigation",
+    status: "published",
+    sortOrder: 0,
+    excerpt: "Six primary items, deliberately.",
+    priorRevisions: 2,
+    data: {
+      primary: [
+        { label: "About", href: "/about" },
+        { label: "Policy", href: "/policy" },
+        { label: "Members", href: "/members" },
+        { label: "Media", href: "/media" },
+        { label: "Events", href: "/events" },
+        { label: "Membership", href: "/membership" },
+      ],
+      footer: [
+        { label: "Contact", href: "/contact" },
+        { label: "Governing documents", href: "/about/documents" },
+        { label: "AI disclosure", href: "/ai-disclosure" },
+      ],
+    },
+  });
+  const SETTINGS: [string, string, string][] = [
+    ["site-name", "Washington CannaBusiness Association", "Rendered in the masthead and the document title."],
+    ["short-name", "WACA", "Used where the full name does not fit."],
+    ["general-email", `info@waca.${EMAIL_DOMAIN}`, "Synthetic address. The real one arrives with the importer."],
+    ["media-email", `media@waca.${EMAIL_DOMAIN}`, "Synthetic address."],
+    ["member-portal-url", "https://members.example.org", "Synthetic. Points at the portal in production."],
+  ];
+  SETTINGS.forEach(([slug, value, note], i) => {
+    itemSeeds.push({
+      type: "setting",
+      slug,
+      title: slug.replace(/-/g, " "),
+      status: "published",
+      sortOrder: i,
+      excerpt: value,
+      priorRevisions: 0,
+      data: { value, note },
+    });
+  });
+
+  /**
+   * An EARLIER version of an item's payload.
+   *
+   * Revision N of a seeded item used to be a byte-for-byte copy of revision 1,
+   * which made the history screen technically correct and completely useless:
+   * every comparison read "identical in every field". A revision history where
+   * nothing ever changed cannot demonstrate a diff, and cannot be reviewed.
+   *
+   * `stepsBack` is how far back this revision is from the current one. The
+   * newest revision is ALWAYS the untouched payload, so what is live still
+   * matches content_items.data exactly.
+   */
+  const LONG_TEXT_KEYS = ["body", "bio", "lede", "description"];
+  function earlierDraftOf(
+    data: Record<string, unknown>,
+    stepsBack: number,
+  ): Record<string, unknown> {
+    if (stepsBack <= 0) return data;
+    const copy: Record<string, unknown> = { ...data };
+
+    // Prefer shortening the prose: an earlier draft with fewer sentences is
+    // what an edit history actually looks like.
+    for (const key of LONG_TEXT_KEYS) {
+      const value = copy[key];
+      if (typeof value === "string" && value.length > 60) {
+        const parts = value.split(". ").filter(Boolean);
+        if (parts.length > 1) {
+          const keep = Math.max(1, parts.length - stepsBack);
+          const kept = parts.slice(0, keep).join(". ");
+          copy[key] = kept.endsWith(".") ? kept : `${kept}.`;
+          return copy;
+        }
+        // One long sentence: an earlier draft got as far as most of it.
+        const words = value.split(" ");
+        const keep = Math.max(6, words.length - stepsBack * 4);
+        copy[key] = `${words.slice(0, keep).join(" ").replace(/[.,]$/, "")}.`;
+        return copy;
+      }
+    }
+
+    // No prose to shorten: an earlier draft had not filled in the last
+    // optional fields yet.
+    const keys = Object.keys(copy);
+    for (let i = 0; i < stepsBack && keys.length - i > 3; i += 1) {
+      delete copy[keys[keys.length - 1 - i]];
+    }
+    return copy;
+  }
+
+  /* Write items, then their revisions, then point the published ones at the
+   * revision that is live -- the same three steps saveDraft() + publishItems()
+   * take, so the seed cannot produce a state the application could not. */
+  const itemRows: (typeof s.contentItems.$inferInsert & { id: string })[] = [];
+  const revisionRows: (typeof s.contentRevisions.$inferInsert & { id: string })[] = [];
+  const revisionSeqRows: (typeof s.contentRevisionSequences.$inferInsert)[] = [];
+  const liveRevisionByItem = new Map<string, string>();
+
+  for (const seed of itemSeeds) {
+    const id = uid();
+    const createdAt = addDays(TODAY, -int(30, 700));
+    itemRows.push({
+      id,
+      type: seed.type,
+      slug: seed.slug,
+      title: seed.title,
+      // Inserted as a draft even when it will end up published: CHECK
+      // content_items_published_needs_revision refuses a published row with no
+      // live revision, and the revision does not exist yet. The UPDATE below
+      // sets status and published_revision_id together, which is exactly what
+      // publishItems() does.
+      status: seed.status === "published" ? "draft" : seed.status,
+      data: seed.data,
+      locale: "en-US",
+      sortOrder: seed.sortOrder ?? 0,
+      excerpt: seed.excerpt ?? null,
+      publishAt: seed.publishAt ?? null,
+      unpublishAt: null,
+      publishedRevisionId: null,
+      publishedAt: seed.status === "published" ? addDays(createdAt, int(0, 20)) : null,
+      createdBy: adminUser.id,
+      updatedBy: chance(0.5) ? adminUser.id : staffUser.id,
+      createdAt,
+      updatedAt: addDays(createdAt, int(0, 40)),
+    });
+
+    const total = (seed.priorRevisions ?? 0) + 1;
+    let last = "";
+    for (let n = 1; n <= total; n++) {
+      const rid = uid();
+      last = rid;
+      revisionRows.push({
+        id: rid,
+        itemId: id,
+        revisionNumber: n,
+        data: earlierDraftOf(seed.data, total - n),
+        title: seed.title,
+        slug: seed.slug,
+        excerpt: seed.excerpt ?? null,
+        summary:
+          n === 1
+            ? "Created."
+            : n === total
+              ? pick(["Copy edit.", "Updated the lede.", "Fixed a link.", "Board feedback."])
+              : pick(["Draft revision.", "Restructured.", "Added a quote."]),
+        authorUserId: chance(0.6) ? adminUser.id : staffUser.id,
+        authorLabel: chance(0.6) ? adminUser.name : staffUser.name,
+        restoredFromRevisionId: null,
+        createdAt: addDays(createdAt, n),
+      });
+    }
+    revisionSeqRows.push({ itemId: id, lastNumber: total });
+    if (seed.status === "published") liveRevisionByItem.set(id, last);
+  }
+
+  await db.insert(s.contentItems).values(itemRows);
+  await db.insert(s.contentRevisions).values(revisionRows);
+  await db.insert(s.contentRevisionSequences).values(revisionSeqRows);
+  for (const [itemId, revisionId] of liveRevisionByItem) {
+    await db.execute(sql`
+      UPDATE content_items
+         SET status = 'published', published_revision_id = ${revisionId}::uuid
+       WHERE id = ${itemId}::uuid
+    `);
+  }
+
+  /* ---------------------------------------------------- content assets */
+  const ASSETS: [string, string, string | null, number, number, string | null, boolean][] = [
+    ["hero-capitol-steps.jpg", "image/jpeg", "Members on the Capitol steps in Olympia at Day on the Hill.", 2400, 1350, "WACA staff photo", false],
+    ["hero-greenhouse.jpg", "image/jpeg", "Rows of plants under lights in a licensed production facility.", 2400, 1350, "WACA staff photo", false],
+    ["board-meeting.jpg", "image/jpeg", "Trustees around a table at the autumn board meeting.", 1600, 1067, "WACA staff photo", false],
+    ["spring-meeting-panel.jpg", "image/jpeg", "Four panellists on stage at the spring meeting.", 1600, 1067, "WACA staff photo", false],
+    ["testimony-hearing-room.jpg", "image/jpeg", "A witness table in a legislative hearing room.", 1600, 1067, null, false],
+    ["sector-council-retail.jpg", "image/jpeg", "Retail sector council members in discussion.", 1600, 1067, null, false],
+    ["divider-leaf-pattern.svg", "image/svg+xml", null, 1200, 80, null, false],
+    ["market-size-chart.png", "image/png", "Bar chart of licensed market revenue by year, 2016 to 2025.", 1200, 800, "Chart by WACA", false],
+    ["agenda-cover-2026.png", "image/png", "Cover of the 2026 legislative agenda.", 1000, 1294, null, false],
+    ["logo-waca-mark.svg", "image/svg+xml", "WACA logo.", 400, 400, null, false],
+    ["illustrative-skyline.png", "image/png", "Stylised Olympia skyline at dusk.", 1600, 600, "Generated illustration", true],
+    ["2026-agenda.pdf", "application/pdf", null, 0, 0, null, false],
+  ];
+  const assetRows = ASSETS.map(([filename, mime, alt, w, h, credit, ai], i) => ({
+    id: uid(),
+    key: `content/2026/${filename}`,
+    filename,
+    mime,
+    bytes: int(40_000, 3_500_000),
+    width: mime.startsWith("image/") ? w : null,
+    height: mime.startsWith("image/") ? h : null,
+    // The divider is the one genuinely decorative image; everything else
+    // carries alt text, and the CHECK in 0006 will not let it be otherwise.
+    altText: alt,
+    isDecorative: mime.startsWith("image/") && alt === null,
+    credit,
+    aiGenerated: ai,
+    aiNote: ai ? "Generated illustration; disclosed on /ai-disclosure." : null,
+    longDescription:
+      filename === "market-size-chart.png"
+        ? "Licensed market revenue rises from 2016 to a 2021 peak, then flattens through 2025."
+        : null,
+    uploadedBy: i % 2 === 0 ? adminUser.id : staffUser.id,
+    createdAt: addDays(TODAY, -int(20, 500)),
+  }));
+  await db.insert(s.contentAssets).values(assetRows);
+
+  /* Point some content at the library.
+   *
+   * A media library nothing references is a folder. These UPDATEs give the
+   * page and post collections real asset fields, which is what makes the
+   * picker, the alt-text gate and the `assets` map on /api/content/* visible
+   * in the demo rather than theoretical.
+   *
+   * Both the item AND its live revision are patched. Patching only the item
+   * would leave the working copy and the published revision disagreeing —
+   * which is precisely the state the two-column design exists to prevent, and
+   * a seed must never produce a state the application could not.
+   */
+  const HERO_KEYS = [
+    "content/2026/hero-capitol-steps.jpg",
+    "content/2026/hero-greenhouse.jpg",
+  ];
+  const POST_IMAGE_KEYS = [
+    "content/2026/board-meeting.jpg",
+    "content/2026/spring-meeting-panel.jpg",
+    "content/2026/sector-council-retail.jpg",
+  ];
+
+  for (const [type, field, keys] of [
+    ["page", "heroImage", HERO_KEYS],
+    ["post", "image", POST_IMAGE_KEYS],
+  ] as const) {
+    const targets = itemRows.filter((r) => r.type === type).slice(0, keys.length);
+    for (const [i, row] of targets.entries()) {
+      const key = keys[i];
+      await db.execute(sql`
+        UPDATE content_items
+           SET data = jsonb_set(data, ${`{${field}}`}::text[], to_jsonb(${key}::text), true)
+         WHERE id = ${row.id}::uuid
+      `);
+      await db.execute(sql`
+        UPDATE content_revisions
+           SET data = jsonb_set(data, ${`{${field}}`}::text[], to_jsonb(${key}::text), true)
+         WHERE item_id = ${row.id}::uuid
+           AND revision_number = (
+             SELECT max(revision_number) FROM content_revisions
+              WHERE item_id = ${row.id}::uuid)
+      `);
+    }
+  }
+
+  /* -------------------------------------------------- publish history */
+  const publishedItemIds = [...liveRevisionByItem.keys()];
+  const publishRows = Array.from({ length: 6 }, (_, i) => {
+    const started = addDays(TODAY, -(4 + i * 23));
+    const batch = publishedItemIds.slice(i * 5, i * 5 + int(2, 7));
+    const failed = i === 4;
+    return {
+      id: uid(),
+      status: (failed ? "failed" : "succeeded") as (typeof s.contentPublishStatusEnum.enumValues)[number],
+      itemIds: batch,
+      itemCount: batch.length,
+      triggeredBy: i % 2 === 0 ? adminUser.id : staffUser.id,
+      triggeredByLabel: i % 2 === 0 ? adminUser.name : staffUser.name,
+      note: pick([
+        "Press round-up.",
+        "Agenda page correction.",
+        "Leadership page update.",
+        "Weekly publish.",
+      ]),
+      deployHookStatus: failed ? 500 : 201,
+      deployHookResponse: failed
+        ? { error: "deploy hook returned 500" }
+        : { job: { id: `demo-${uid().slice(0, 8)}`, state: "PENDING" } },
+      deploymentId: failed ? null : `dpl_${uid().slice(0, 12)}`,
+      deploymentUrl: failed ? null : `https://waca-web-${uid().slice(0, 7)}.vercel.app`,
+      error: failed ? "Vercel deploy hook returned 500; retried by hand." : null,
+      startedAt: started,
+      completedAt: addDays(started, 0),
+    };
+  });
+  await db.insert(s.contentPublishes).values(publishRows);
+
+  /* ==================================================================== *
+   *  EMAIL
+   * ==================================================================== */
+
+  const levelId = (slug: string) => levelBySlug.get(slug)!.id;
+  const councilId = (slug: string) => councilBySlug.get(slug)!.id;
+
+  type AudienceSeed = {
+    name: string;
+    description: string;
+    isDynamic: boolean;
+    rules: s.AudienceRule;
+  };
+  const audienceSeeds: AudienceSeed[] = [
+    {
+      name: "All members",
+      description: "Every contact at an organisation holding a current membership, in any status.",
+      isDynamic: true,
+      rules: { all: [{ field: "has_membership", op: "is", value: true }] },
+    },
+    {
+      name: "Full members",
+      description: "Contacts at organisations on any Full membership level.",
+      isDynamic: true,
+      rules: {
+        all: [
+          { field: "membership_level", op: "in", values: ["full-1", "full-2", "full-3", "full-4"].map(levelId) },
+        ],
+      },
+    },
+    {
+      name: "Level 1 only",
+      description: "Full Membership Level 1 — the top fee band, and where most of the dues income sits.",
+      isDynamic: true,
+      rules: { all: [{ field: "membership_level", op: "in", values: [levelId("full-1")] }] },
+    },
+    {
+      name: "Retail council",
+      description: "Everyone actively sitting on the retail sector council.",
+      isDynamic: true,
+      rules: { all: [{ field: "sector_council", op: "in", values: [councilId("retail")] }] },
+    },
+    {
+      name: "Producers council",
+      description: "Everyone actively sitting on the producer sector council.",
+      isDynamic: true,
+      rules: { all: [{ field: "sector_council", op: "in", values: [councilId("producers")] }] },
+    },
+    {
+      name: "Labs and transporters",
+      description: "Contacts at lab and transport organisations, whether or not they sit on the council.",
+      isDynamic: true,
+      rules: {
+        all: [{ field: "organization_category", op: "in", values: ["lab-transport"] }],
+      },
+    },
+    {
+      name: "Ancillary",
+      description: "Contacts at ancillary businesses — the service providers around the licensed market.",
+      isDynamic: true,
+      rules: { all: [{ field: "organization_category", op: "in", values: ["ancillary"] }] },
+    },
+    {
+      name: "Lapsed and overdue",
+      description:
+        "Renewal is overdue or the membership has lapsed. The list the renewal push goes to; note it deliberately does NOT test the subscribed flag, because a renewal notice is transactional.",
+      isDynamic: true,
+      rules: {
+        all: [
+          { field: "membership_status", op: "in", values: ["renewal-overdue", "lapsed", "pending-renewal"] },
+        ],
+      },
+    },
+    {
+      name: "Non-member contacts",
+      description:
+        "Agency staff, legislative offices, journalists and prospects. No current membership anywhere, and opted in.",
+      isDynamic: true,
+      rules: {
+        all: [
+          { field: "has_membership", op: "is", value: false },
+          { field: "subscribed", op: "is", value: true },
+        ],
+      },
+    },
+    {
+      name: "2026 Day on the Hill attendees (snapshot)",
+      description:
+        "Frozen list of confirmed attendees, taken the morning after the event so a follow-up can be re-sent to exactly the people who got the original.",
+      isDynamic: false,
+      rules: {
+        all: [
+          {
+            field: "event_attendance",
+            op: "attended",
+            values: eventInserts
+              .filter((e) => e.kind === "day-on-the-hill")
+              .slice(0, 2)
+              .map((e) => e.id),
+          },
+        ],
+      },
+    },
+  ];
+
+  const audienceRows = audienceSeeds.map((a) => ({
+    id: uid(),
+    name: a.name,
+    description: a.description,
+    rules: a.rules,
+    isDynamic: a.isDynamic,
+    snapshotTakenAt: a.isDynamic ? null : addDays(TODAY, -170),
+    lastResolvedCount: null as number | null,
+    lastResolvedAt: addDays(TODAY, -int(1, 20)),
+    createdBy: adminUser.id,
+    createdAt: addDays(TODAY, -int(200, 500)),
+  }));
+  await db.insert(s.audiences).values(audienceRows);
+  const audienceByName = new Map(audienceRows.map((a) => [a.name, a]));
+
+  const mailableContacts = contactSeeds.filter((c) => !!c.email);
+
+  /* --------------------------------------------------------- templates */
+  const templateRows = [
+    {
+      id: uid(),
+      name: "Member newsletter",
+      description: "The fortnightly round-up: policy, events, member news.",
+      subject: "WACA This Fortnight",
+      preheader: "Policy movement, upcoming meetings, and what your council is working on.",
+      category: "newsletter" as const,
+      blocks: [
+        { type: "heading", level: 1, text: "WACA This Fortnight" },
+        { type: "paragraph", html: "<p>The short version of what moved.</p>" },
+        { type: "dynamic", source: "upcoming-events", limit: 3 },
+        { type: "divider" },
+        { type: "dynamic", source: "recent-press", limit: 4 },
+      ] as s.EmailBlock[],
+      textBody:
+        "WACA THIS FORTNIGHT\n\nThe short version of what moved.\n\nUpcoming events follow, then recent coverage.\n\nUnsubscribe: {{unsubscribe_url}}",
+    },
+    {
+      id: uid(),
+      name: "Policy alert",
+      description: "Short, urgent, one ask. Used when a bill moves.",
+      subject: "Policy alert: {{bill}}",
+      preheader: "One ask, and the deadline.",
+      category: "policy-alert" as const,
+      blocks: [
+        { type: "heading", level: 1, text: "Policy alert" },
+        { type: "paragraph", html: "<p>What moved, and what we are asking members to do.</p>" },
+        { type: "button", label: "Read the position", href: "https://example.org/" },
+      ] as s.EmailBlock[],
+      textBody:
+        "POLICY ALERT\n\nWhat moved, and what we are asking members to do.\n\nRead the position: https://example.org/\n\nUnsubscribe: {{unsubscribe_url}}",
+    },
+    {
+      id: uid(),
+      name: "Event invitation",
+      description: "Meetings, the spring meeting, Day on the Hill.",
+      subject: "You're invited: {{event}}",
+      preheader: "Date, place, and how to register.",
+      category: "event" as const,
+      blocks: [
+        { type: "heading", level: 1, text: "{{event}}" },
+        { type: "paragraph", html: "<p>Date, venue and agenda.</p>" },
+        { type: "button", label: "Register", href: "https://example.org/" },
+      ] as s.EmailBlock[],
+      textBody:
+        "{{event}}\n\nDate, venue and agenda.\n\nRegister: https://example.org/\n\nUnsubscribe: {{unsubscribe_url}}",
+    },
+    {
+      id: uid(),
+      name: "Renewal reminder",
+      description: "Membership renewal. Transactional in tone, and never sent to a suppressed address.",
+      subject: "Your WACA membership renews on {{date}}",
+      preheader: "What is due, and how to settle it.",
+      category: "membership" as const,
+      blocks: [
+        { type: "heading", level: 1, text: "Your membership renewal" },
+        { type: "paragraph", html: "<p>WACA settles offline — cheque, ACH or bank transfer. There is no card payment.</p>" },
+      ] as s.EmailBlock[],
+      textBody:
+        "YOUR MEMBERSHIP RENEWAL\n\nWACA settles offline - cheque, ACH or bank transfer. There is no card payment.\n\nUnsubscribe: {{unsubscribe_url}}",
+    },
+  ].map((t) => ({
+    ...t,
+    // Rendered from the template's own blocks by the same renderer the
+    // composer uses, so a template's plain-text part is a real rendering
+    // rather than a second, hand-maintained copy that can drift.
+    textBody: renderCampaign({
+      subject: t.subject,
+      preheader: t.preheader,
+      blocks: t.blocks,
+    }).text,
+    createdBy: adminUser.id,
+    createdAt: addDays(TODAY, -int(300, 600)),
+  }));
+  await db.insert(s.emailTemplates).values(templateRows);
+
+  /* --------------------------------------------------------- campaigns */
+  const CAMPAIGN_PLAN: {
+    name: string;
+    subject: string;
+    audience: string;
+    template: number;
+    category: (typeof s.emailCategoryEnum.enumValues)[number];
+    daysAgo: number;
+    status: (typeof s.campaignStatusEnum.enumValues)[number];
+  }[] = [
+    { name: "February newsletter", subject: "WACA This Fortnight — February", audience: "All members", template: 0, category: "newsletter", daysAgo: 190, status: "sent" },
+    { name: "Day on the Hill invitation", subject: "You're invited: 2026 Day on the Hill", audience: "All members", template: 2, category: "event", daysAgo: 178, status: "sent" },
+    { name: "Excise tax alert", subject: "Policy alert: excise tax restructuring", audience: "Full members", template: 1, category: "policy-alert", daysAgo: 160, status: "sent" },
+    { name: "Retail signage consultation", subject: "Retail council: signage limits consultation", audience: "Retail council", template: 1, category: "policy-alert", daysAgo: 141, status: "sent" },
+    { name: "Canopy reporting update", subject: "Producers: canopy reporting is changing", audience: "Producers council", template: 1, category: "policy-alert", daysAgo: 122, status: "sent" },
+    { name: "April newsletter", subject: "WACA This Fortnight — April", audience: "All members", template: 0, category: "newsletter", daysAgo: 104, status: "sent" },
+    { name: "Lab accreditation briefing", subject: "Labs and transporters: accreditation timeline", audience: "Labs and transporters", template: 1, category: "policy-alert", daysAgo: 86, status: "sent" },
+    { name: "Spring meeting invitation", subject: "You're invited: 2026 Spring Meeting", audience: "All members", template: 2, category: "event", daysAgo: 63, status: "sent" },
+    { name: "Renewal push — overdue", subject: "Your WACA membership renewal is overdue", audience: "Lapsed and overdue", template: 3, category: "membership", daysAgo: 41, status: "sent" },
+    { name: "Ancillary member survey", subject: "Two minutes: what should WACA do for ancillary members?", audience: "Ancillary", template: 0, category: "newsletter", daysAgo: 22, status: "sent" },
+    { name: "August newsletter", subject: "WACA This Fortnight — August", audience: "All members", template: 0, category: "newsletter", daysAgo: 3, status: "sent" },
+    { name: "2027 agenda announcement", subject: "The 2027 agenda is ratified", audience: "All members", template: 0, category: "newsletter", daysAgo: -34, status: "scheduled" },
+    { name: "Non-member policy digest", subject: "WACA policy digest", audience: "Non-member contacts", template: 1, category: "policy-alert", daysAgo: 0, status: "draft" },
+  ];
+
+  /** Which contacts each named audience covers, in seed terms.
+   *  orgById / membershipByOrg are the maps built above; reused, not rebuilt. */
+  const councilContactIds = new Map<string, Set<string>>();
+  for (const cm of councilMemberInserts) {
+    const set = councilContactIds.get(cm.councilId as string) ?? new Set<string>();
+    set.add(cm.contactId as string);
+    councilContactIds.set(cm.councilId as string, set);
+  }
+
+  function audienceContacts(name: string): typeof contactSeeds {
+    switch (name) {
+      case "All members":
+        return mailableContacts.filter((c) => membershipByOrg.has(c.orgId));
+      case "Full members":
+        return mailableContacts.filter((c) => {
+          const m = membershipByOrg.get(c.orgId);
+          return !!m && ["full-1", "full-2", "full-3", "full-4"].map(levelId).includes(m.levelId as string);
+        });
+      case "Level 1 only":
+        return mailableContacts.filter(
+          (c) => membershipByOrg.get(c.orgId)?.levelId === levelId("full-1"),
+        );
+      case "Retail council":
+        return mailableContacts.filter((c) =>
+          councilContactIds.get(councilId("retail"))?.has(c.id),
+        );
+      case "Producers council":
+        return mailableContacts.filter((c) =>
+          councilContactIds.get(councilId("producers"))?.has(c.id),
+        );
+      case "Labs and transporters":
+        return mailableContacts.filter(
+          (c) => orgById.get(c.orgId)?.category === "lab-transport",
+        );
+      case "Ancillary":
+        return mailableContacts.filter(
+          (c) => orgById.get(c.orgId)?.category === "ancillary",
+        );
+      case "Lapsed and overdue":
+        return mailableContacts.filter((c) =>
+          ["renewal-overdue", "pending-renewal"].includes(
+            (membershipByOrg.get(c.orgId)?.status as string) ?? "",
+          ),
+        );
+      case "Non-member contacts":
+        return mailableContacts.filter((c) => !membershipByOrg.has(c.orgId)).slice(0, 30);
+      case "2026 Day on the Hill attendees (snapshot)": {
+        const dothIds = new Set(
+          eventInserts.filter((e) => e.kind === "day-on-the-hill").slice(0, 2).map((e) => e.id),
+        );
+        const attended = new Set(
+          registrationInserts
+            .filter((r) => dothIds.has(r.eventId as string) && r.status === "confirmed")
+            .map((r) => r.contactId as string),
+        );
+        return mailableContacts.filter((c) => attended.has(c.id));
+      }
+      default:
+        return mailableContacts;
+    }
+  }
+
+  const campaignRows: (typeof s.campaigns.$inferInsert & { id: string })[] = [];
+  const recipientRows: (typeof s.campaignRecipients.$inferInsert & { id: string })[] = [];
+  const suppressionRows: (typeof s.suppressions.$inferInsert)[] = [];
+  const unsubTokenRows: (typeof s.unsubscribeTokens.$inferInsert)[] = [];
+  const suppressed = new Set<string>();
+
+  /** Deterministic sha256, so the seed stays byte-identical run to run. */
+  const sha256 = (v: string) => createHash("sha256").update(v, "utf8").digest("hex");
+
+  // A handful of addresses that were already suppressed before any of these
+  // campaigns ran — hard bounces and two complaints. These are what the
+  // campaign_recipients trigger exists to keep out.
+  for (let i = 0; i < 9; i++) {
+    const c = mailableContacts[int(0, mailableContacts.length - 1)];
+    const email = c.email.toLowerCase();
+    if (suppressed.has(email)) continue;
+    suppressed.add(email);
+    suppressionRows.push({
+      id: uid(),
+      email,
+      reason: i < 6 ? "bounced" : "complained",
+      source: "resend-webhook",
+      campaignId: null,
+      contactId: c.id,
+      detail: i < 6 ? "550 5.1.1 mailbox unavailable" : "Marked as spam by the recipient.",
+      createdAt: addDays(TODAY, -int(200, 400)),
+    });
+  }
+
+  for (const plan of CAMPAIGN_PLAN) {
+    const id = uid();
+    const audience = audienceByName.get(plan.audience)!;
+    const template = templateRows[plan.template];
+    const sentAt = plan.status === "sent" ? addDays(TODAY, -plan.daysAgo) : null;
+    const people = audienceContacts(plan.audience).filter(
+      (c) => !suppressed.has(c.email.toLowerCase()),
+    );
+
+    let deliveredCount = 0;
+    let uniqueOpenCount = 0;
+    let uniqueClickCount = 0;
+    let bounceCount = 0;
+    let complaintCount = 0;
+    let unsubscribeCount = 0;
+
+    if (plan.status === "sent") {
+      for (const person of people) {
+        const roll = rng();
+        let status: (typeof s.campaignRecipientStatusEnum.enumValues)[number];
+        // WACA's real newsletters run about 60% opens. Model that: ~2.5%
+        // bounce, and of what is delivered, ~17% click, ~44% open without
+        // clicking -> ~61% unique opens of delivered.
+        if (roll < 0.025) status = "bounced";
+        else if (roll < 0.029) status = "complained";
+        else if (roll < 0.038) status = "unsubscribed";
+        else if (roll < 0.205) status = "clicked";
+        else if (roll < 0.63) status = "opened";
+        else status = "delivered";
+
+        const rid = uid();
+        const sent = addDays(sentAt!, 0);
+        const opened =
+          status === "opened" || status === "clicked" || status === "unsubscribed"
+            ? new Date(sent.getTime() + int(4, 2600) * 60000)
+            : null;
+
+        if (status === "bounced") bounceCount++;
+        else deliveredCount++;
+        if (status === "complained") complaintCount++;
+        if (status === "unsubscribed") unsubscribeCount++;
+        if (status === "opened" || status === "clicked" || status === "unsubscribed")
+          uniqueOpenCount++;
+        if (status === "clicked") uniqueClickCount++;
+
+        recipientRows.push({
+          id: rid,
+          campaignId: id,
+          contactId: person.id,
+          email: person.email.toLowerCase(),
+          status,
+          providerMessageId: `demo-${rid.slice(0, 18)}`,
+          sentAt: sent,
+          deliveredAt: status === "bounced" ? null : new Date(sent.getTime() + int(1, 400) * 1000),
+          firstOpenedAt: opened,
+          lastOpenedAt: opened ? new Date(opened.getTime() + int(0, 5000) * 60000) : null,
+          firstClickedAt:
+            status === "clicked" && opened
+              ? new Date(opened.getTime() + int(1, 240) * 60000)
+              : null,
+          openCount: opened ? int(1, 6) : 0,
+          clickCount: status === "clicked" ? int(1, 4) : 0,
+          error: status === "bounced" ? "550 5.1.1 mailbox unavailable" : null,
+          createdAt: sent,
+        });
+
+        // An unsubscribe or a hard bounce lands on the global list, exactly as
+        // redeem_unsubscribe_token() and the webhook reducer would put it there.
+        const email = person.email.toLowerCase();
+        if ((status === "unsubscribed" || status === "bounced" || status === "complained") && !suppressed.has(email)) {
+          suppressed.add(email);
+          suppressionRows.push({
+            id: uid(),
+            email,
+            reason:
+              status === "unsubscribed"
+                ? "unsubscribed"
+                : status === "bounced"
+                  ? "bounced"
+                  : "complained",
+            source: status === "unsubscribed" ? "unsubscribe-link" : "resend-webhook",
+            campaignId: id,
+            contactId: person.id,
+            detail:
+              status === "unsubscribed"
+                ? "Unsubscribed via the link in a WACA email."
+                : "550 5.1.1 mailbox unavailable",
+            createdAt: sent,
+          });
+          if (status === "unsubscribed") {
+            unsubTokenRows.push({
+              id: uid(),
+              contactId: person.id,
+              tokenHash: sha256(`demo-unsub-${rid}`),
+              scope: "all",
+              category: null,
+              campaignId: id,
+              expiresAt: null,
+              usedAt: opened ?? sent,
+              createdAt: sent,
+            });
+          }
+        }
+      }
+    }
+
+    const recipientCount = plan.status === "sent" ? people.length : 0;
+
+    // The body is BLOCKS, and both rendered parts come from them through the
+    // one renderer the composer uses. Seeding a hand-written html_body would
+    // put rows in the database that the application itself could never have
+    // produced -- and, because the review gate reads the rendered bytes, rows
+    // that would fail their own CAN-SPAM check.
+    const campaignBlocks: s.EmailBlock[] = [
+      { type: "heading", level: 1, text: plan.subject },
+      {
+        type: "paragraph",
+        html: `Dear {{first_name}}, here is the ${plan.name.toLowerCase()} for {{organization|your organisation}}.`,
+      },
+      ...template.blocks.filter((b) => b.type !== "heading"),
+      {
+        type: "member-data",
+        heading: "Your WACA membership",
+        fields: [
+          { field: "organization", label: "Organisation", fallback: null },
+          { field: "membership_level", label: "Level", fallback: null },
+          { field: "renewal_date", label: "Renews", fallback: null },
+        ],
+      },
+    ];
+    const body = renderCampaign({
+      subject: plan.subject,
+      preheader: template.preheader,
+      blocks: campaignBlocks,
+      audienceNote: `You are receiving this because you are on WACA's \u201c${audience.name}\u201d list.`,
+    });
+
+    campaignRows.push({
+      id,
+      name: plan.name,
+      templateId: template.id,
+      audienceId: audience.id,
+      subject: plan.subject,
+      preheader: template.preheader,
+      fromName: "Washington CannaBusiness Association",
+      fromEmail: `news@waca.${EMAIL_DOMAIN}`,
+      replyTo: `info@waca.${EMAIL_DOMAIN}`,
+      category: plan.category,
+      status: plan.status,
+      blocks: campaignBlocks,
+      htmlBody: body.html,
+      // NOT NULL and non-empty for anything past draft -- see the CHECK.
+      textBody: body.text,
+      // A test send is a review-gate fact, not a claim. The two unsent
+      // campaigns in the seed have had one; that is why they can be walked
+      // through the gate in a demo.
+      testSentAt: plan.status === "sent" ? sentAt : addDays(TODAY, -1),
+      testSentTo: `staff@waca.${EMAIL_DOMAIN}`,
+      scheduledAt: plan.status === "scheduled" ? addDays(TODAY, -plan.daysAgo) : null,
+      sentAt,
+      createdBy: chance(0.5) ? adminUser.id : staffUser.id,
+      // The send gate. A 'sent' row cannot exist without all four of these.
+      approvedBy: plan.status === "sent" ? adminUser.id : null,
+      approvedAt: plan.status === "sent" ? addDays(sentAt!, 0) : null,
+      sendConfirmationToken:
+        plan.status === "sent" ? `demo-confirm-${id.slice(0, 22)}` : null,
+      sendConfirmationExpiresAt: plan.status === "sent" ? addDays(sentAt!, 1) : null,
+      sendConfirmedAt: plan.status === "sent" ? addDays(sentAt!, 0) : null,
+      approvedRecipientCount: plan.status === "sent" ? recipientCount : null,
+      recipientCount,
+      sentCount: recipientCount,
+      deliveredCount,
+      uniqueOpenCount,
+      uniqueClickCount,
+      bounceCount,
+      complaintCount,
+      unsubscribeCount,
+      failedCount: 0,
+      suppressedCount: 0,
+      createdAt: sentAt ? addDays(sentAt, -int(2, 9)) : addDays(TODAY, -int(1, 12)),
+    });
+  }
+
+  await db.insert(s.campaigns).values(campaignRows);
+  // Suppressions BEFORE recipients would refuse the very rows that recorded
+  // the unsubscribe, so the historical recipient rows go in first and the
+  // list follows. From here on the trigger governs: nothing may be added to a
+  // campaign for an address on it.
+  if (recipientRows.length) {
+    for (let i = 0; i < recipientRows.length; i += 500) {
+      await db.insert(s.campaignRecipients).values(recipientRows.slice(i, i + 500));
+    }
+  }
+  if (suppressionRows.length) await db.insert(s.suppressions).values(suppressionRows);
+
+  // A few live, unredeemed unsubscribe links, so the public page is testable.
+  for (let i = 0; i < 12; i++) {
+    const c = mailableContacts[int(0, mailableContacts.length - 1)];
+    unsubTokenRows.push({
+      id: uid(),
+      contactId: c.id,
+      tokenHash: sha256(`demo-unsub-live-${i}-${c.id}`),
+      scope: i < 9 ? "all" : "category",
+      category: i < 9 ? null : "fundraising",
+      campaignId: campaignRows[campaignRows.length - 3].id,
+      expiresAt: null,
+      usedAt: null,
+      createdAt: addDays(TODAY, -int(1, 40)),
+    });
+  }
+  if (unsubTokenRows.length)
+    await db.insert(s.unsubscribeTokens).values(unsubTokenRows);
+
+  // Provider webhook events for the two most recent sends, deduped on
+  // provider_event_id exactly as the real webhook would be.
+  const recentCampaignIds = campaignRows
+    .filter((c) => c.status === "sent")
+    .slice(-2)
+    .map((c) => c.id);
+  const eventRowsEmail: (typeof s.emailEvents.$inferInsert)[] = [];
+  for (const r of recipientRows.filter((r) => recentCampaignIds.includes(r.campaignId as string))) {
+    const base = (r.sentAt as Date) ?? TODAY;
+    eventRowsEmail.push({
+      id: uid(),
+      provider: "resend",
+      providerEventId: `evt_${(r.id as string).replace(/-/g, "").slice(0, 24)}_sent`,
+      eventType: "email.sent",
+      providerMessageId: r.providerMessageId as string,
+      campaignId: r.campaignId as string,
+      recipientId: r.id as string,
+      contactId: r.contactId as string,
+      email: r.email as string,
+      payload: { demo: true },
+      occurredAt: base,
+      processedAt: base,
+    });
+    if (r.firstOpenedAt) {
+      eventRowsEmail.push({
+        id: uid(),
+        provider: "resend",
+        providerEventId: `evt_${(r.id as string).replace(/-/g, "").slice(0, 24)}_open`,
+        eventType: "email.opened",
+        providerMessageId: r.providerMessageId as string,
+        campaignId: r.campaignId as string,
+        recipientId: r.id as string,
+        contactId: r.contactId as string,
+        email: r.email as string,
+        payload: { demo: true },
+        occurredAt: r.firstOpenedAt as Date,
+        processedAt: r.firstOpenedAt as Date,
+      });
+    }
+  }
+  for (let i = 0; i < eventRowsEmail.length; i += 500) {
+    await db.insert(s.emailEvents).values(eventRowsEmail.slice(i, i + 500));
+  }
+
+  // Record the real resolved size on each audience, using the same numbers the
+  // admin screen will compute.
+  for (const a of audienceRows) {
+    const people = audienceContacts(a.name);
+    await db.execute(sql`
+      UPDATE audiences SET last_resolved_count = ${people.length},
+                           last_resolved_at = ${TODAY.toISOString()}::timestamptz
+       WHERE id = ${a.id}::uuid
+    `);
+    if (!a.isDynamic && people.length) {
+      await db.insert(s.audienceMembers).values(
+        people.map((p) => ({
+          id: uid(),
+          audienceId: a.id,
+          contactId: p.id,
+          email: p.email.toLowerCase(),
+          addedAt: a.snapshotTakenAt ?? TODAY,
+        })),
+      );
+    }
+  }
+
   /* ----------------------------------------------------------- summary */
   const tables = [
     "users","accounts","sessions","verification_tokens",
@@ -1861,6 +3277,10 @@ async function main() {
     "registrations","event_sponsorships",
     "invoices","invoice_lines","payments","payment_allocations","refunds",
     "documents","document_downloads","audit_log",
+    "content_types","content_items","content_revisions",
+    "content_revision_sequences","content_assets","content_publishes",
+    "audiences","audience_members","email_templates","campaigns",
+    "campaign_recipients","email_events","suppressions","unsubscribe_tokens",
   ];
 
   console.log("\nSeed complete.  IS_DEMO_DATA = true\n");

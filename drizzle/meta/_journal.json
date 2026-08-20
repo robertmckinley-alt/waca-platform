@@ -43,6 +43,27 @@
       "when": 1787192686059,
       "tag": "0005_invoice_reference",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1787201066429,
+      "tag": "0006_content_and_email",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1787200000000,
+      "tag": "0007_content_email_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787202675054,
+      "tag": "0008_campaign_blocks",
+      "breakpoints": true
     }
   ]
 }

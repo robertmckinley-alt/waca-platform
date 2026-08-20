@@ -127,12 +127,17 @@ export async function sendInvoiceAction(
 
     if (parsed.data.email === "on") {
       const sent = await emailInvoice(parsed.data.invoiceId);
-      if (sent.delivered) {
+      if (sent.transmitted) {
         return ok(`${invoice.number} marked sent and emailed to ${sent.to}.`);
       }
-      if (sent.reason === "no-api-key") {
+      if (sent.reason === "dry-run") {
         return ok(
-          `${invoice.number} marked sent. No RESEND_API_KEY is configured, so the email was logged to the server console instead of delivered.`,
+          `${invoice.number} marked sent. This deployment is in DRY RUN, so the email was rendered and logged to the server console and nothing was transmitted.`,
+        );
+      }
+      if (sent.blocked) {
+        return ok(
+          `${invoice.number} marked sent, but ${sent.to} is on the suppression list (${sent.blocked}), so no email was attempted. Post it or telephone instead.`,
         );
       }
       if (sent.reason === "no-recipient") {
@@ -228,11 +233,13 @@ export async function recordPaymentAction(
     if (input.emailReceipt === "on") {
       const sent = await emailPaymentReceipt({ paymentId: payment.id });
       parts.push(
-        sent.delivered
+        sent.transmitted
           ? `Receipt emailed to ${sent.to}.`
-          : sent.reason === "no-api-key"
-            ? "No RESEND_API_KEY set — the receipt was logged to the console."
-            : "The receipt could not be emailed; the payment is saved.",
+          : sent.reason === "dry-run"
+            ? "This deployment is in DRY RUN — the receipt was rendered and logged, and nothing was transmitted."
+            : sent.blocked
+              ? `${sent.to} is on the suppression list (${sent.blocked}), so no receipt was attempted.`
+              : "The receipt could not be emailed; the payment is saved.",
       );
     }
 

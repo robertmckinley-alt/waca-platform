@@ -42,6 +42,14 @@ export interface Fixtures {
   /** A document the demo member MAY read. */
   permittedDocumentTitle: string;
   organizationId: string;
+  /** An unsent campaign — the builder, preview and review gate. */
+  draftCampaignId: string;
+  /** A campaign that has been sent — the report and its CSV export. */
+  sentCampaignId: string;
+  /** A saved audience — the segment builder. */
+  audienceId: string;
+  /** An email template. */
+  templateId: string;
 }
 
 export default async function globalSetup() {
@@ -97,6 +105,17 @@ export default async function globalSetup() {
        and access_scope = 'members'
      limit 1`;
 
+  const [draftCampaign] = await sql`
+    select id from campaigns where status in ('draft','ready','scheduled')
+     order by created_at desc limit 1`;
+  const [sentCampaign] = await sql`
+    select id from campaigns where status = 'sent'
+     order by sent_at desc limit 1`;
+  const [audience] = await sql`
+    select id from audiences where archived_at is null order by name limit 1`;
+  const [template] = await sql`
+    select id from email_templates where archived_at is null order by name limit 1`;
+
   await sql.end();
 
   const missing: string[] = [];
@@ -105,6 +124,10 @@ export default async function globalSetup() {
   if (!restrictedEvent) missing.push("an admin-only or invite-only event");
   if (!forbidden) missing.push("a council-restricted document the member cannot read");
   if (!permitted) missing.push("a members-scope document");
+  if (!draftCampaign) missing.push("an unsent campaign");
+  if (!sentCampaign) missing.push("a sent campaign");
+  if (!audience) missing.push("a saved audience");
+  if (!template) missing.push("an email template");
   if (missing.length) {
     throw new Error(
       `The seed does not contain ${missing.join(", ")}. The security tests ` +
@@ -127,6 +150,10 @@ export default async function globalSetup() {
     forbiddenDocumentTitle: forbidden.title,
     permittedDocumentTitle: permitted.title,
     organizationId: member.organization_id,
+    draftCampaignId: draftCampaign.id,
+    sentCampaignId: sentCampaign.id,
+    audienceId: audience.id,
+    templateId: template.id,
   };
 
   writeFileSync(

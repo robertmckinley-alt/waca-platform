@@ -1,27 +1,41 @@
+import type { EmailBlock } from "@/db/schema";
 import { money } from "@/lib/finance/money";
 import { OFFLINE_PAYMENT_TERMS, REMITTANCE } from "@/lib/finance/invoices";
-import {
-  detailRows,
-  escapeHtml,
-  layout,
-  type RenderedEmail,
-} from "./client";
+import { renderTransactional, type TransactionalMessage } from "./transactional";
+import type { RenderedEmail } from "./client";
 
 /**
  * ===========================================================================
- *  THE TEMPLATES.
+ *  THE TRANSACTIONAL TEMPLATES — now made of BLOCKS.
  *
- *  Five, matching the five moments money changes hands at WACA:
+ *  Four, matching the four moments money changes hands at WACA:
  *
  *    invoiceSent            "here is your bill, here is where to send it"
  *    paymentReceived        "we have your cheque, thank you"
  *    renewalReminder        three tones across the ladder — see below
  *    registrationConfirmed  "you are registered, here is the invoice"
  *
- *  EVERY template is a pure function: context in, {subject, html, text} out.
- *  Nothing here touches the database or the network, so a template can be
- *  rendered in a test, printed to a console, or previewed in the admin
- *  without sending anything.
+ *  WHAT CHANGED, AND WHY IT MATTERS.
+ *
+ *  These templates used to build HTML by string concatenation through a
+ *  `layout()` helper that was a second, simpler email system living beside
+ *  the campaign renderer — with its own table markup, its own idea of a
+ *  footer, and a plain-text part written out by hand a second time beneath
+ *  the HTML one. Two systems means the invoice a member receives is tested,
+ *  fixed and improved separately from the newsletter they receive an hour
+ *  later, and the plain-text part of one of them is always the neglected one.
+ *
+ *  Now every template returns BLOCKS, and the blocks go through
+ *  `renderTransactional()` — which is `renderCampaign()` with the
+ *  transactional footer. So an invoice gets exactly the Outlook-proof table
+ *  markup, the readable plain-text rendering, the merge-field fallbacks and
+ *  the dark-mode declarations that the newsletter gets, because it is the
+ *  same code.
+ *
+ *  EVERY template is still a pure function: context in, message out. Nothing
+ *  here touches the database or the network, so a template can be rendered in
+ *  a test, printed to a console or previewed in the admin without sending
+ *  anything.
  *
  *  THE THREE TONES. A renewal ladder that says the same thing five times is
  *  a ladder people learn to ignore:
@@ -38,25 +52,50 @@ import {
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
 
-const remittanceText = [
-  "How to pay",
-  `  Cheque:  payable to ${REMITTANCE.organisation}`,
-  `           ${REMITTANCE.addressLines.join(", ")}`,
-  "  ACH / bank transfer: details on request from " + REMITTANCE.email,
-  "  Please quote the invoice number on the remittance.",
-  "  WACA does not accept card payments.",
-].join("\n");
+/**
+ * What a template returns: the blocks (so the composer, a preview screen or a
+ * future edit can work with structure) AND the rendered parts (so the
+ * existing callers and tests, which want `.subject`/`.html`/`.text`, keep
+ * working). Rendered once, here, by the one renderer.
+ */
+export interface TransactionalTemplate extends TransactionalMessage, RenderedEmail {}
 
-const remittanceHtml = `
-<div style="margin-top:18px;padding:12px 14px;background:#fafafa;border:1px solid #e4e4e7;border-radius:4px;font-size:12px;color:#3f3f46">
-  <div style="font-weight:600;margin-bottom:6px">How to pay</div>
-  <div><strong>Cheque</strong> — payable to ${escapeHtml(REMITTANCE.organisation)},<br/>
-       ${REMITTANCE.addressLines.map(escapeHtml).join("<br/>")}</div>
-  <div style="margin-top:6px"><strong>ACH or bank transfer</strong> — details on request from
-       ${escapeHtml(REMITTANCE.email)}</div>
-  <div style="margin-top:6px;color:#71717a">Please quote the invoice number on your remittance.
-       WACA does not accept card payments.</div>
-</div>`;
+function build(message: TransactionalMessage): TransactionalTemplate {
+  const rendered = renderTransactional(message);
+  return {
+    ...message,
+    subject: rendered.subject,
+    html: rendered.html,
+    text: rendered.text,
+  };
+}
+
+/** The remittance panel, as blocks, so it is identical in all four templates
+ *  and in both renderings. */
+function remittanceBlocks(): EmailBlock[] {
+  return [
+    { type: "divider" },
+    { type: "heading", level: 3, text: "How to pay" },
+    {
+      type: "list",
+      ordered: false,
+      items: [
+        `Cheque — payable to ${REMITTANCE.organisation}, ${REMITTANCE.addressLines.join(", ")}`,
+        `ACH or bank transfer — details on request from ${REMITTANCE.email}`,
+        "Please quote the invoice number on your remittance.",
+        REMITTANCE.noCardNotice,
+      ],
+    },
+  ];
+}
+
+function detailList(rows: [string, string][]): EmailBlock {
+  return {
+    type: "list",
+    ordered: false,
+    items: rows.map(([label, value]) => `${label}: ${value}`),
+  };
+}
 
 /* ===================================================================== */
 /*  1. Invoice sent                                                      */
@@ -77,71 +116,42 @@ export interface InvoiceSentContext {
   pdfUrl?: string | null;
 }
 
-export function invoiceSent(ctx: InvoiceSentContext): RenderedEmail {
-  const subject = `Invoice ${ctx.invoiceNumber} from WACA — ${money(ctx.totalCents)}`;
+export function invoiceSent(ctx: InvoiceSentContext): TransactionalTemplate {
+  const blocks: EmailBlock[] = [
+    { type: "heading", level: 2, text: `Invoice ${ctx.invoiceNumber}` },
+    {
+      type: "paragraph",
+      html: `Hello ${ctx.recipientName}, please find invoice <b>${ctx.invoiceNumber}</b>${
+        ctx.organizationName ? ` for ${ctx.organizationName}` : ""
+      }.`,
+    },
+    {
+      type: "list",
+      ordered: false,
+      items: ctx.lines.map(
+        (l) =>
+          `${l.description}${l.quantity > 1 ? ` × ${l.quantity}` : ""} — ${money(l.amountCents)}`,
+      ),
+    },
+    detailList([
+      ["Total", money(ctx.totalCents)],
+      ["Due", ctx.dueOn ?? "on receipt"],
+      ...(ctx.balanceCents !== ctx.totalCents
+        ? ([["Balance outstanding", money(ctx.balanceCents)]] as [string, string][])
+        : []),
+      ...(ctx.reference
+        ? ([["Your reference", ctx.reference]] as [string, string][])
+        : []),
+    ]),
+    ...(ctx.memo ? [{ type: "paragraph" as const, html: ctx.memo }] : []),
+    ...remittanceBlocks(),
+  ];
 
-  const lineText = ctx.lines
-    .map(
-      (l) =>
-        `  • ${l.description}${l.quantity > 1 ? ` x ${l.quantity}` : ""} — ${money(l.amountCents)}`,
-    )
-    .join("\n");
-
-  const text = [
-    `Hello ${ctx.recipientName},`,
-    "",
-    `Please find invoice ${ctx.invoiceNumber}${ctx.organizationName ? ` for ${ctx.organizationName}` : ""}.`,
-    "",
-    lineText,
-    "",
-    `Total:   ${money(ctx.totalCents)}`,
-    `Due:     ${ctx.dueOn ?? "on receipt"}`,
-    ctx.reference ? `Your ref: ${ctx.reference}` : "",
-    "",
-    remittanceText,
-    "",
-    ctx.memo ? `${ctx.memo}\n` : "",
-    "Washington CannaBusiness Association",
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const html = layout(
-    `<p>Hello ${escapeHtml(ctx.recipientName)},</p>
-     <p>Please find invoice <strong>${escapeHtml(ctx.invoiceNumber)}</strong>${
-       ctx.organizationName
-         ? ` for ${escapeHtml(ctx.organizationName)}`
-         : ""
-     }.</p>
-     <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-size:13px;margin:16px 0">
-       <thead><tr>
-         <th align="left" style="border-bottom:1px solid #e4e4e7;padding:6px 0;color:#71717a;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Description</th>
-         <th align="right" style="border-bottom:1px solid #e4e4e7;padding:6px 0;color:#71717a;font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Amount</th>
-       </tr></thead>
-       <tbody>${ctx.lines
-         .map(
-           (l) =>
-             `<tr><td style="padding:6px 12px 6px 0;border-bottom:1px solid #f4f4f5">${escapeHtml(l.description)}${
-               l.quantity > 1 ? ` &times; ${l.quantity}` : ""
-             }</td><td align="right" style="padding:6px 0;border-bottom:1px solid #f4f4f5;font-variant-numeric:tabular-nums">${money(l.amountCents)}</td></tr>`,
-         )
-         .join("")}</tbody>
-     </table>
-     ${detailRows(
-       [
-         ["Total", money(ctx.totalCents)],
-         ["Due", ctx.dueOn ?? "On receipt"],
-         ...(ctx.reference
-           ? ([["Your reference", ctx.reference]] as [string, string][])
-           : []),
-       ].filter(Boolean) as [string, string][],
-     )}
-     ${ctx.memo ? `<p style="color:#52525b;font-size:13px">${escapeHtml(ctx.memo)}</p>` : ""}
-     ${remittanceHtml}`,
-    `Invoice ${ctx.invoiceNumber}`,
-  );
-
-  return { subject, html, text };
+  return build({
+    subject: `Invoice ${ctx.invoiceNumber} from WACA — ${money(ctx.totalCents)}`,
+    preheader: `${money(ctx.totalCents)} due ${ctx.dueOn ?? "on receipt"}. ${OFFLINE_PAYMENT_TERMS}`,
+    blocks,
+  });
 }
 
 /* ===================================================================== */
@@ -160,76 +170,57 @@ export interface PaymentReceivedContext {
   unappliedCents: number;
 }
 
-export function paymentReceived(ctx: PaymentReceivedContext): RenderedEmail {
+export function paymentReceived(
+  ctx: PaymentReceivedContext,
+): TransactionalTemplate {
   const settled = ctx.appliedTo.filter((a) => a.balanceCents <= 0);
   const subject =
     settled.length === 1 && ctx.appliedTo.length === 1
       ? `Payment received — invoice ${settled[0].invoiceNumber} is paid in full`
       : `Payment received — ${money(ctx.amountCents)}`;
 
-  const appliedText = ctx.appliedTo
-    .map(
-      (a) =>
-        `  • ${a.invoiceNumber}: ${money(a.amountCents)} applied` +
-        (a.balanceCents > 0
-          ? ` — ${money(a.balanceCents)} still outstanding`
-          : " — paid in full"),
-    )
-    .join("\n");
+  const blocks: EmailBlock[] = [
+    { type: "heading", level: 2, text: "Payment received" },
+    {
+      type: "paragraph",
+      html: `Hello ${ctx.recipientName}, thank you — we have recorded your <b>${ctx.method}</b> payment of <b>${money(
+        ctx.amountCents,
+      )}</b>, received ${ctx.receivedOn}.`,
+    },
+    ...(ctx.reference
+      ? [detailList([["Reference", ctx.reference]])]
+      : []),
+    ...(ctx.appliedTo.length
+      ? [
+          { type: "heading" as const, level: 3 as const, text: "Applied to" },
+          {
+            type: "list" as const,
+            ordered: false,
+            items: ctx.appliedTo.map(
+              (a) =>
+                `${a.invoiceNumber}: ${money(a.amountCents)} applied` +
+                (a.balanceCents > 0
+                  ? ` — ${money(a.balanceCents)} still outstanding`
+                  : " — paid in full"),
+            ),
+          },
+        ]
+      : []),
+    ...(ctx.unappliedCents > 0
+      ? [
+          {
+            type: "paragraph" as const,
+            html: `${money(ctx.unappliedCents)} is held as a credit on your account and will be applied to your next invoice.`,
+          },
+        ]
+      : []),
+  ];
 
-  const text = [
-    `Hello ${ctx.recipientName},`,
-    "",
-    `Thank you — we have recorded your ${ctx.method} payment of ${money(ctx.amountCents)}, received ${ctx.receivedOn}.`,
-    ctx.reference ? `Reference: ${ctx.reference}` : "",
-    "",
-    ctx.appliedTo.length ? `Applied to:\n${appliedText}` : "",
-    ctx.unappliedCents > 0
-      ? `\n${money(ctx.unappliedCents)} is held as a credit on your account and will be applied to your next invoice.`
-      : "",
-    "",
-    "Washington CannaBusiness Association",
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const html = layout(
-    `<p>Hello ${escapeHtml(ctx.recipientName)},</p>
-     <p>Thank you — we have recorded your <strong>${escapeHtml(ctx.method)}</strong> payment of
-        <strong>${money(ctx.amountCents)}</strong>, received ${escapeHtml(ctx.receivedOn)}.</p>
-     ${detailRows(
-       [
-         ["Amount", money(ctx.amountCents)],
-         ["Method", ctx.method],
-         ["Received", ctx.receivedOn],
-         ...(ctx.reference
-           ? ([["Reference", ctx.reference]] as [string, string][])
-           : []),
-       ] as [string, string][],
-     )}
-     ${
-       ctx.appliedTo.length
-         ? `<div style="font-size:13px"><div style="font-weight:600;margin-bottom:4px">Applied to</div>
-            <ul style="margin:0;padding-left:18px">${ctx.appliedTo
-              .map(
-                (a) =>
-                  `<li>${escapeHtml(a.invoiceNumber)} — ${money(a.amountCents)}${
-                    a.balanceCents > 0
-                      ? `, <span style="color:#b45309">${money(a.balanceCents)} still outstanding</span>`
-                      : ", paid in full"
-                  }</li>`,
-              )
-              .join("")}</ul></div>`
-         : ""
-     }
-     ${
-       ctx.unappliedCents > 0
-         ? `<p style="font-size:13px;color:#52525b">${money(ctx.unappliedCents)} is held as a credit on your account and will be applied to your next invoice.</p>`
-         : ""
-     }`,
-  );
-
-  return { subject, html, text };
+  return build({
+    subject,
+    preheader: `${money(ctx.amountCents)} recorded against your account on ${ctx.receivedOn}.`,
+    blocks,
+  });
 }
 
 /* ===================================================================== */
@@ -263,7 +254,7 @@ export function toneForRung(
 export function renewalReminder(
   tone: ReminderTone,
   ctx: RenewalReminderContext,
-): RenderedEmail {
+): TransactionalTemplate {
   const portal = ctx.portalUrl ?? `${APP_URL}/portal`;
   const days = Math.abs(ctx.daysUntilExpiry);
 
@@ -271,135 +262,86 @@ export function renewalReminder(
     ? `Invoice ${ctx.invoiceNumber} for ${money(ctx.feeCents)} has been raised.`
     : `Your renewal is ${money(ctx.feeCents)}.`;
 
-  if (tone === "heads-up") {
-    const subject = `${ctx.organizationName}: WACA membership renews in ${days} days`;
-    const text = [
-      `Hello ${ctx.recipientName},`,
-      "",
-      `A note for your diary: ${ctx.organizationName}'s ${ctx.levelName} runs to ${ctx.expiresOn} — ${days} days from now.`,
-      "",
-      invoiceLine,
-      ctx.autoRenew
-        ? "Your renewal invoice is raised and sent automatically, so there is nothing for you to start."
-        : "We will send the renewal invoice nearer the date.",
-      "",
-      `Your membership: ${portal}`,
-      "",
-      remittanceText,
-      "",
-      "Washington CannaBusiness Association",
-    ].join("\n");
+  const facts = detailList([
+    ["Organisation", ctx.organizationName],
+    ["Level", ctx.levelName],
+    ["Renewal fee", money(ctx.feeCents)],
+    [tone === "lapsed" ? "Expired" : "Expires", ctx.expiresOn],
+    ...(ctx.invoiceNumber
+      ? ([["Invoice", ctx.invoiceNumber]] as [string, string][])
+      : []),
+  ]);
 
-    return {
-      subject,
-      text,
-      html: layout(
-        `<p>Hello ${escapeHtml(ctx.recipientName)},</p>
-         <p>A note for your diary: <strong>${escapeHtml(ctx.organizationName)}</strong>'s
-            ${escapeHtml(ctx.levelName)} runs to <strong>${escapeHtml(ctx.expiresOn)}</strong> —
-            ${days} days from now.</p>
-         ${detailRows([
-           ["Membership", ctx.levelName],
-           ["Renewal", money(ctx.feeCents)],
-           ["Expires", ctx.expiresOn],
-           ["Auto-renew", ctx.autoRenew ? "On" : "Off"],
-         ])}
-         <p style="font-size:13px;color:#52525b">${escapeHtml(
-           ctx.autoRenew
-             ? "Your renewal invoice is raised and sent automatically, so there is nothing for you to start."
-             : "We will send the renewal invoice nearer the date.",
-         )}</p>
-         <p><a href="${portal}" style="display:inline-block;background:#18181b;color:#fff;text-decoration:none;padding:9px 14px;border-radius:4px;font-size:13px">View your membership</a></p>
-         ${remittanceHtml}`,
-      ),
-    };
+  const cta: EmailBlock = {
+    type: "button",
+    label: "Your membership",
+    href: portal,
+  };
+
+  if (tone === "heads-up") {
+    return build({
+      subject: `${ctx.organizationName}: WACA membership renews in ${days} days`,
+      preheader: `${ctx.levelName} runs to ${ctx.expiresOn}. Nothing to do yet.`,
+      blocks: [
+        { type: "heading", level: 2, text: "A note for your diary" },
+        {
+          type: "paragraph",
+          html: `Hello ${ctx.recipientName}, <b>${ctx.organizationName}</b>'s ${ctx.levelName} runs to <b>${ctx.expiresOn}</b> — ${days} days from now.`,
+        },
+        facts,
+        {
+          type: "paragraph",
+          html: ctx.autoRenew
+            ? `${invoiceLine} Your renewal invoice is raised and sent automatically, so there is nothing for you to start.`
+            : `${invoiceLine} We will send the renewal invoice nearer the date.`,
+        },
+        cta,
+        ...remittanceBlocks(),
+      ],
+    });
   }
 
   if (tone === "due") {
-    const subject = `Action needed: ${ctx.organizationName}'s WACA membership expires ${ctx.expiresOn}`;
-    const text = [
-      `Hello ${ctx.recipientName},`,
-      "",
-      `${ctx.organizationName}'s ${ctx.levelName} expires on ${ctx.expiresOn} — ${days} day${days === 1 ? "" : "s"} away.`,
-      "",
-      invoiceLine,
-      "To keep your benefits — the weekly legislative detail report, sector council seats, and member rates at WACA events — please settle it before the expiry date.",
-      "",
-      remittanceText,
-      "",
-      `Your membership: ${portal}`,
-      "",
-      "Washington CannaBusiness Association",
-    ].join("\n");
-
-    return {
-      subject,
-      text,
-      html: layout(
-        `<p>Hello ${escapeHtml(ctx.recipientName)},</p>
-         <p><strong>${escapeHtml(ctx.organizationName)}</strong>'s ${escapeHtml(ctx.levelName)} expires on
-            <strong>${escapeHtml(ctx.expiresOn)}</strong> — ${days} day${days === 1 ? "" : "s"} away.</p>
-         ${detailRows([
-           ["Renewal", money(ctx.feeCents)],
-           ...(ctx.invoiceNumber
-             ? ([["Invoice", ctx.invoiceNumber]] as [string, string][])
-             : []),
-           ["Expires", ctx.expiresOn],
-         ])}
-         <p style="font-size:13px">To keep your benefits — the weekly legislative detail report,
-            sector council seats, and member rates at WACA events — please settle it before the
-            expiry date.</p>
-         ${remittanceHtml}
-         <p><a href="${portal}" style="display:inline-block;background:#18181b;color:#fff;text-decoration:none;padding:9px 14px;border-radius:4px;font-size:13px">View your membership</a></p>`,
-        ctx.invoiceNumber ? `Invoice ${ctx.invoiceNumber}` : undefined,
-      ),
-    };
+    return build({
+      subject: `Action needed: ${ctx.organizationName}'s WACA membership expires ${ctx.expiresOn}`,
+      preheader: `${days} days left. ${invoiceLine}`,
+      blocks: [
+        { type: "heading", level: 2, text: "Your renewal is due" },
+        {
+          type: "paragraph",
+          html: `Hello ${ctx.recipientName}, <b>${ctx.organizationName}</b>'s ${ctx.levelName} expires on <b>${ctx.expiresOn}</b> — ${days} days from now.`,
+        },
+        facts,
+        { type: "paragraph", html: invoiceLine },
+        {
+          type: "paragraph",
+          html: "Settling it before the expiry date keeps your member access, your council seats and your event pricing unbroken.",
+        },
+        cta,
+        ...remittanceBlocks(),
+      ],
+    });
   }
 
-  const subject = `${ctx.organizationName}'s WACA membership has lapsed`;
-  const text = [
-    `Hello ${ctx.recipientName},`,
-    "",
-    `${ctx.organizationName}'s ${ctx.levelName} expired on ${ctx.expiresOn}, ${days} day${days === 1 ? "" : "s"} ago, and has not been renewed.`,
-    "",
-    "Access to the weekly legislative detail report and to members-only documents has stopped, sector council seats are on hold, and event registrations are now at the non-member rate.",
-    "",
-    invoiceLine,
-    "Settling it restores everything immediately — nothing is lost.",
-    "",
-    remittanceText,
-    "",
-    `If you have decided not to renew, reply to this email and we will close the record and stop writing.`,
-    "",
-    "Washington CannaBusiness Association",
-  ].join("\n");
-
-  return {
-    subject,
-    text,
-    html: layout(
-      `<p>Hello ${escapeHtml(ctx.recipientName)},</p>
-       <p><strong>${escapeHtml(ctx.organizationName)}</strong>'s ${escapeHtml(ctx.levelName)} expired on
-          <strong>${escapeHtml(ctx.expiresOn)}</strong>, ${days} day${days === 1 ? "" : "s"} ago,
-          and has not been renewed.</p>
-       <div style="margin:14px 0;padding:12px 14px;background:#fef2f2;border:1px solid #fecaca;border-radius:4px;font-size:13px;color:#7f1d1d">
-         Access to the weekly legislative detail report and to members-only documents has stopped,
-         sector council seats are on hold, and event registrations are now at the non-member rate.
-       </div>
-       ${detailRows([
-         ["Renewal", money(ctx.feeCents)],
-         ...(ctx.invoiceNumber
-           ? ([["Invoice", ctx.invoiceNumber]] as [string, string][])
-           : []),
-         ["Expired", ctx.expiresOn],
-       ])}
-       <p style="font-size:13px">Settling it restores everything immediately — nothing is lost.</p>
-       ${remittanceHtml}
-       <p style="font-size:12px;color:#71717a">If you have decided not to renew, reply to this email
-          and we will close the record and stop writing.</p>`,
-      ctx.invoiceNumber ? `Invoice ${ctx.invoiceNumber}` : undefined,
-    ),
-  };
+  return build({
+    subject: `${ctx.organizationName}'s WACA membership has lapsed`,
+    preheader: `Expired ${ctx.expiresOn}. Member access has stopped; renewing restores it.`,
+    blocks: [
+      { type: "heading", level: 2, text: "Your membership has lapsed" },
+      {
+        type: "paragraph",
+        html: `Hello ${ctx.recipientName}, <b>${ctx.organizationName}</b>'s ${ctx.levelName} expired on <b>${ctx.expiresOn}</b>, ${days} days ago.`,
+      },
+      facts,
+      {
+        type: "paragraph",
+        html: "Member access to the document library, the sector councils and member event pricing has stopped. Renewing restores all of it, and your council seats are held for you in the meantime.",
+      },
+      { type: "paragraph", html: invoiceLine },
+      cta,
+      ...remittanceBlocks(),
+    ],
+  });
 }
 
 /* ===================================================================== */
@@ -421,75 +363,64 @@ export interface RegistrationConfirmedContext {
 
 /**
  * The FINANCE flavour of the registration confirmation — the one that carries
- * the invoice. The events module has its own multi-ticket variant in
- * `@/lib/events/email.ts`; this one is sent when the finance module raises
- * the invoice, so the attendee gets the bill and the confirmation together.
+ * the invoice. The events module's own multi-ticket variant is in
+ * `@/lib/events/email.ts` and now goes through this same renderer.
  */
 export function registrationConfirmed(
   ctx: RegistrationConfirmedContext,
-): RenderedEmail {
-  const subject = ctx.waitlisted
-    ? `Waitlisted: ${ctx.eventName}`
-    : `You are registered: ${ctx.eventName}`;
+): TransactionalTemplate {
+  const blocks: EmailBlock[] = [
+    {
+      type: "heading",
+      level: 2,
+      text: ctx.waitlisted ? "You are on the waitlist" : "You are registered",
+    },
+    {
+      type: "paragraph",
+      html: ctx.waitlisted
+        ? `Hello ${ctx.attendeeName}, you are on the <b>waitlist</b> for ${ctx.eventName}. We will email you the moment a place opens up.`
+        : `Hello ${ctx.attendeeName}, your registration for <b>${ctx.eventName}</b> is confirmed.`,
+    },
+    detailList([
+      ["When", ctx.eventWhen],
+      ["Where", ctx.eventWhere],
+      ["Ticket", ctx.ticketName],
+      ["Amount", money(ctx.amountCents)],
+      ...(ctx.invoice
+        ? ([
+            ["Invoice", ctx.invoice.number],
+            ["Due", ctx.invoice.dueOn ?? "on receipt"],
+          ] as [string, string][])
+        : []),
+    ]),
+    ...(ctx.eventUrl
+      ? [
+          {
+            type: "button" as const,
+            label: "Event details",
+            href: ctx.eventUrl,
+          },
+        ]
+      : []),
+    ...(ctx.invoice
+      ? remittanceBlocks()
+      : ctx.amountCents === 0
+        ? [
+            {
+              type: "paragraph" as const,
+              html: "There is nothing to pay for this registration.",
+            },
+          ]
+        : []),
+  ];
 
-  const invoiceText = ctx.invoice
-    ? [
-        "",
-        `Invoice ${ctx.invoice.number} for ${money(ctx.invoice.totalCents)} is due ${ctx.invoice.dueOn ?? "on receipt"}.`,
-        "",
-        remittanceText,
-      ].join("\n")
-    : ctx.amountCents === 0
-      ? "\nThere is nothing to pay for this registration."
-      : "";
-
-  const text = [
-    `Hello ${ctx.attendeeName},`,
-    "",
-    ctx.waitlisted
-      ? `You are on the waitlist for ${ctx.eventName}. We will email you the moment a place opens up.`
-      : `Your registration for ${ctx.eventName} is confirmed.`,
-    "",
-    `When:   ${ctx.eventWhen}`,
-    `Where:  ${ctx.eventWhere}`,
-    `Ticket: ${ctx.ticketName} — ${money(ctx.amountCents)}`,
-    invoiceText,
-    ctx.eventUrl ? `\nEvent details: ${ctx.eventUrl}` : "",
-    "",
-    "Washington CannaBusiness Association",
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  const html = layout(
-    `<p>Hello ${escapeHtml(ctx.attendeeName)},</p>
-     <p>${
-       ctx.waitlisted
-         ? `You are on the <strong>waitlist</strong> for ${escapeHtml(ctx.eventName)}. We will email you the moment a place opens up.`
-         : `Your registration for <strong>${escapeHtml(ctx.eventName)}</strong> is confirmed.`
-     }</p>
-     ${detailRows([
-       ["When", ctx.eventWhen],
-       ["Where", ctx.eventWhere],
-       ["Ticket", ctx.ticketName],
-       ["Amount", money(ctx.amountCents)],
-       ...(ctx.invoice
-         ? ([
-             ["Invoice", ctx.invoice.number],
-             ["Due", ctx.invoice.dueOn ?? "On receipt"],
-           ] as [string, string][])
-         : []),
-     ])}
-     ${ctx.invoice ? remittanceHtml : ""}
-     ${
-       ctx.eventUrl
-         ? `<p><a href="${ctx.eventUrl}" style="display:inline-block;background:#18181b;color:#fff;text-decoration:none;padding:9px 14px;border-radius:4px;font-size:13px">Event details</a></p>`
-         : ""
-     }`,
-    ctx.invoice ? `Invoice ${ctx.invoice.number}` : undefined,
-  );
-
-  return { subject, html, text };
+  return build({
+    subject: ctx.waitlisted
+      ? `Waitlisted: ${ctx.eventName}`
+      : `You are registered: ${ctx.eventName}`,
+    preheader: `${ctx.eventWhen} · ${ctx.eventWhere}`,
+    blocks,
+  });
 }
 
 /** Every template key the ladder may reference, for the admin preview. */

@@ -22,6 +22,7 @@ import {
 } from "@/lib/events/actions";
 import { SPONSOR_TIER_PRESETS } from "@/lib/events/presets";
 import type { SponsorTierRow } from "@/lib/events/admin-queries";
+import { moneyPlain } from "@/lib/finance/money";
 
 const BLANK: SponsorTierRow = {
   id: "",
@@ -38,7 +39,8 @@ const BLANK: SponsorTierRow = {
   sponsors: [],
 };
 
-const dollars = (cents: number) => (cents / 100).toFixed(2);
+/** THE formatter. A form default and a table cell agree because of this. */
+const dollars = moneyPlain;
 
 /**
  * Sponsor tiers CRUD with the real WACA tier vocabulary as presets, showing

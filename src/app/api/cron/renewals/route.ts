@@ -1,4 +1,5 @@
 import type { NextRequest } from "next/server";
+import { authoriseCron } from "@/lib/cron-auth";
 import {
   dispatchRenewalReminders,
   processRenewals,
@@ -48,42 +49,8 @@ export const dynamic = "force-dynamic";
 /** Renewals for ~90 memberships plus their emails; well inside this. */
 export const maxDuration = 300;
 
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return diff === 0;
-}
-
-function authorise(request: NextRequest): Response | null {
-  const secret = process.env.CRON_SECRET;
-
-  if (!secret) {
-    console.error(
-      "[cron:renewals] CRON_SECRET is not set. Refusing to run — this route " +
-        "raises invoices and emails members, and must never be open.",
-    );
-    return Response.json(
-      { ok: false, error: "CRON_SECRET is not configured on this deployment." },
-      { status: 503 },
-    );
-  }
-
-  const header = request.headers.get("authorization") ?? "";
-  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
-  const query = request.nextUrl.searchParams.get("secret") ?? "";
-
-  if (timingSafeEqual(bearer, secret) || timingSafeEqual(query, secret)) {
-    return null;
-  }
-
-  return Response.json({ ok: false, error: "Unauthorised" }, { status: 401 });
-}
-
 export async function GET(request: NextRequest) {
-  const denied = authorise(request);
+  const denied = authoriseCron(request, "renewals", "raises invoices and emails members");
   if (denied) return denied;
 
   const sp = request.nextUrl.searchParams;

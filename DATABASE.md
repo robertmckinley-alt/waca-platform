@@ -95,6 +95,11 @@ unchanged.
 | `0001_integrity_and_helpers.sql` | Circular `users ↔ contacts` FKs, self-FK on `events.paired_sponsorship_event_id`, deferred invoice FKs, case-insensitive email uniqueness, partial unique indexes (one current membership per org, one primary contact per org), the `display_name` trigger, `updated_at` triggers on every table, and the partial indexes the admin list views need. |
 | `0002_rls_policies.sql` | Supabase roles, the `auth.uid()` shim, `current_app_user()` + helper predicates, RLS enabled on 26 tables, 61 policies. |
 | `0003_contact_tags.sql` | `contacts.tags text[]` (admin-facing member tags, mirroring Wild Apricot's) plus a GIN index. Backs the `tag` filter on `/admin/contacts`. **No backfill in the migration** — real records arrive through the Wild Apricot importer and must not be given invented tags; the synthetic seed populates its own vocabulary. |
+| `0004_invoice_numbering.sql` | `invoice_number_sequences` + `next_invoice_number()`, the gap-free per-fiscal-year allocator, and `ar_age_bucket()`. |
+| `0005_invoice_reference.sql` | `invoices.reference` — the member's own PO/grant code. Never card data. |
+| `0006_content_and_email.sql` | 8 enums and 15 tables for the CMS and the email module, then the hand-written half: the circular `content_items ↔ content_revisions` FK, `next_content_revision_number()`, the alt-text CHECKs, the campaign send gate (CHECK + transition trigger), address normalisation, `is_suppressed()`, and the trigger that refuses a suppressed address on `campaign_recipients`. |
+| `0007_content_email_rls.sql` | RLS on the 15 new tables — staff/admin only, no member-facing read policy anywhere — plus `mask_email()`, `peek_unsubscribe_token()` and `redeem_unsubscribe_token()`: the one deliberately unauthenticated path in the application. |
+| `0008_campaign_blocks.sql` | `campaigns.blocks` (the editable body; `html_body` and `text_body` are both rendered from it), and `campaigns.test_sent_at` / `test_sent_to` — because "a test send has been performed" is one of the nine blocking checks on the review page, and a checklist item that depends on somebody remembering is not a checklist item. |
 
 ```bash
 npm run db:generate     # drizzle-kit generate  (after editing src/db/schema/*)
@@ -198,6 +203,27 @@ Verified behaviour on the seeded database:
 A member `INSERT` into `invoices` fails with
 `new row violates row-level security policy for table "invoices"`.
 
+### The one unauthenticated path
+
+The unsubscribe link in an email footer has to work for somebody with no
+session who will never have one, so the token in the URL is the only
+credential. That path is designed rather than allowed to happen:
+
+* `unsubscribe_tokens` grants **no privilege at all** to `anon` or
+  `authenticated` — not even `SELECT`. There is no policy to get wrong and no
+  query that returns a page of contact ids.
+* The table stores `sha256(token)`, never the raw token. A database dump is
+  not a list of working unsubscribe URLs.
+* Two `SECURITY DEFINER` functions are the whole surface:
+  `peek_unsubscribe_token(text)` (read-only, safe for the GET a corporate link
+  scanner will make) and `redeem_unsubscribe_token(text)` (single-use,
+  idempotent, POST only).
+* Both return a **masked** address (`j••••@e••••.org`) and never the contact
+  id. Every miss returns the identical "not valid" shape, so an enumerating
+  attacker cannot tell "no such token" from "already used" from "expired".
+* Scope is fixed at issue time: a token minted for the fundraising list cannot
+  unsubscribe anyone from their renewal notices.
+
 ### Auth.js tables
 
 `users` carries a policy (self-select, admin-all). `accounts`, `sessions`,
@@ -209,7 +235,7 @@ connection, never by a browser-scoped role.
 
 ## 5. Schema map
 
-30 tables in `src/db/schema/`, split by domain.
+45 tables in `src/db/schema/`, split by domain.
 
 | File | Tables |
 |---|---|
@@ -222,6 +248,8 @@ connection, never by a browser-scoped role.
 | `finance.ts` | `invoices`, `invoice_lines`, `payments`, `payment_allocations`, `refunds` |
 | `documents.ts` | `documents`, `document_downloads` |
 | `audit.ts` | `audit_log` |
+| `content.ts` | `content_types`, `content_items`, `content_revisions`, `content_revision_sequences`, `content_assets`, `content_publishes` |
+| `email.ts` | `audiences`, `audience_members`, `email_templates`, `campaigns`, `campaign_recipients`, `email_events`, `suppressions`, `unsubscribe_tokens` |
 | `index.ts` | barrel + all Drizzle `relations()` |
 
 ### Modelling decisions worth knowing
@@ -298,7 +326,82 @@ getAdminDashboard(opts?: WithExecutor): Promise<AdminDashboard>
 getFilterOptions(opts?: WithExecutor): Promise<FilterOptions>
 getOrganizationBalanceCents(organizationId: string, opts?): Promise<number>
 STAFF_VIEWER: Viewer          // pass to listEvents/listDocumentsFor from /admin
+
+// Content / CMS (src/db/queries/content.ts)
+listContentTypes(opts?: WithExecutor): Promise<ContentTypeRow[]>
+getContentType(key: ContentTypeKey, opts?: WithExecutor): Promise<ContentTypeRow | null>
+listContent(params?: ListContentParams): Promise<Paginated<ContentListRow>>
+getContentItem(idOrSlug: string, opts?: WithExecutor & { type?: ContentTypeKey; locale?: string }): Promise<ContentItemDetail | null>
+listRevisions(itemId: string, params?: ListRevisionsParams): Promise<Paginated<ContentRevisionRow>>
+getRevision(revisionId: string, opts?: WithExecutor): Promise<ContentRevision | null>
+saveDraft(input: SaveDraftInput): Promise<SaveDraftResult>
+restoreRevision(input: RestoreRevisionInput): Promise<SaveDraftResult>
+publishItems(input: PublishItemsInput): Promise<PublishRunResult>
+recordPublishDispatch(input: RecordPublishDispatchInput): Promise<void>
+listPublishes(params?: ListPublishesParams): Promise<Paginated<ContentPublish>>
+listPendingPublish(params?: ListPendingPublishParams): Promise<PendingPublishRow[]>
+listPublishedForApi(params?: ListPublishedForApiParams): Promise<PublishedContentEnvelope>
+listDraftsForApi(params?: ListDraftsForApiParams): Promise<PublishedContentEnvelope>
+applyContentSchedule(opts?: WithExecutor & { now?: Date }): Promise<{ published: string[]; unpublished: string[] }>
+createAsset(input: CreateAssetInput): Promise<ContentAsset>
+listAssets(params?: ListAssetsParams): Promise<Paginated<ContentAsset>>
+getAssetsByKeys(keys: string[], opts?: WithExecutor): Promise<Record<string, ContentAsset>>
+getContentCounts(opts?: WithExecutor): Promise<ContentCounts>
+
+// listPendingPublish() backs /admin/content/publish: every item whose newest
+// revision is newer than the live one, WITH both revision payloads, so the
+// queue can diff twelve items without twenty-four round trips.
+//
+// listDraftsForApi() is the mirror image of listPublishedForApi() and backs
+// /api/content/preview ONLY. It is a separate function rather than a flag on
+// the published one on purpose: a boolean called `includeDrafts` on the
+// function that feeds the public API is one wrong default away from
+// publishing WACA's unreleased statements. Two functions cannot be confused.
+
+// Email (src/db/queries/email.ts)
+listAudiences(params?: ListAudiencesParams): Promise<Paginated<AudienceListRow>>
+getAudience(audienceId: string, opts?: WithExecutor): Promise<Audience | null>
+resolveAudience(rules: AudienceRule, opts?: ResolveAudienceOptions): Promise<string[]>
+resolveAudienceById(audienceId: string, opts?: WithExecutor): Promise<string[]>
+previewAudienceCount(rules: AudienceRule, opts?: WithExecutor): Promise<AudiencePreview>
+snapshotAudience(audienceId: string, opts?: WithExecutor): Promise<{ count: number }>
+compileAudienceRule(rule: AudienceRule): SQL
+listTemplates(params?: ListTemplatesParams): Promise<Paginated<EmailTemplate>>
+getTemplate(templateId: string, opts?: WithExecutor): Promise<EmailTemplate | null>
+listCampaigns(params?: ListCampaignsParams): Promise<Paginated<CampaignListRow>>
+getCampaign(campaignId: string, opts?: WithExecutor): Promise<CampaignDetail | null>
+listCampaignRecipients(campaignId: string, params?: ListRecipientsParams): Promise<Paginated<CampaignRecipient>>
+buildRecipients(input: BuildRecipientsInput): Promise<BuildRecipientsResult>
+approveCampaign(input: ApproveCampaignInput): Promise<ApproveCampaignResult>
+beginCampaignSend(input: BeginCampaignSendInput): Promise<{ campaignId: string; recipientCount: number }>
+listSuppressions(params?: ListSuppressionsParams): Promise<Paginated<SuppressionRow>>
+suppress(input: SuppressInput): Promise<Suppression>
+isSuppressed(email: string, opts?: WithExecutor): Promise<boolean>
+filterSuppressed(emails: string[], opts?: WithExecutor): Promise<Set<string>>
+issueUnsubscribeToken(input: IssueUnsubscribeTokenInput): Promise<{ token: string; id: string }>
+peekUnsubscribeToken(token: string, opts?: WithExecutor): Promise<UnsubscribePeek>
+redeemUnsubscribeToken(token: string, opts?: WithExecutor): Promise<UnsubscribeResult>
+getEmailCounts(opts?: WithExecutor): Promise<EmailCounts>
+
+// Added by the email tool. These exist so the sentence a human is shown
+// before a send ("3,246 contacts -> 3,180 after suppressions -> 3,174 after
+// bounces") is computed by the SAME predicate that builds the send.
+previewAudienceDeductions(audienceId: string, opts?: WithExecutor): Promise<AudienceDeductions>
+sampleAudience(rules: AudienceRule, params?: SampleAudienceParams): Promise<AudienceSampleRow[]>
+sampleAudienceById(audienceId: string, params?: SampleAudienceParams): Promise<AudienceSampleRow[]>
+getMergeSubject(contactId: string, opts?: WithExecutor): Promise<AudienceSampleRow | null>
+getListHealth(opts?: WithExecutor): Promise<ListHealth>
 ```
+
+The content and email mutators (`saveDraft`, `restoreRevision`,
+`publishItems`, `buildRecipients`, `approveCampaign`, `beginCampaignSend`,
+`suppress`) validate their input with exported Zod schemas and take an
+optional `{ db }` executor, but they do **not** write `audit_log` themselves —
+the calling server action does, inside the same transaction, exactly as every
+other mutation in this codebase does. The Zod schemas (`saveDraftSchema`,
+`publishItemsSchema`, `buildRecipientsSchema`, `suppressSchema`,
+`audienceRuleSchema`, `createAssetSchema`, `restoreRevisionSchema`) are
+exported so the action and the helper validate the same shape.
 
 `listRenewals` and `getRenewalRiskSummary` share one predicate builder, so the
 "dollars at risk" callout on `/admin/renewals` can never disagree with the rows
@@ -337,6 +440,14 @@ Demo logins (password `waca-demo-password`):
 | bundle_admin | a seeded bundle administrator (printed by the seed) |
 | member | a seeded plain member (printed by the seed) |
 
+The seed also produces the content and email account: 10 content types, 105
+content items across all ten collections (mirroring the public site's real
+information architecture, with invented copy), 203 revisions, 12 assets, 6
+publish runs; 10 audiences matching WACA's real segment shapes, 4 templates,
+11 sent campaigns with 531 recipient rows whose open rates land around 60%
+(the rate WACA's real newsletters run at), 135 provider events, 29
+suppressions and 17 unsubscribe tokens.
+
 ---
 
 ## 8. Rules that are not negotiable
@@ -358,6 +469,19 @@ Demo logins (password `waca-demo-password`):
    Reports are members-only; council packets are council-restricted.
 6. **`@/db` is server-only.** It opens a Postgres socket and throws if pulled
    into a Client Component.
+7. **Nothing but `buildRecipients()` inserts into `campaign_recipients`,** and
+   nothing but `beginCampaignSend()` moves a campaign to `sending`. The first
+   anti-joins the global suppression list in SQL; the second redeems a
+   single-use human confirmation token in the same statement that flips the
+   status, and treats zero rows updated as a refusal to send. A CHECK
+   constraint and a trigger enforce both regardless of what the caller does.
+8. **`content_items.data` is the draft; `content_revisions.data` for
+   `published_revision_id` is what is live.** `/api/content/*` reads the
+   second, through `listPublishedForApi()`. Never serve the first.
+9. **Alt text is required on images by CHECK**, not by the form. An image
+   asset carries alt text or is explicitly declared decorative. There is no
+   third state, and `content_assets` is written by the importer and the seed
+   as well as by the upload form.
 
 ---
 

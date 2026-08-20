@@ -4,6 +4,14 @@
     {
       "path": "/api/cron/renewals",
       "schedule": "0 13 * * *"
+    },
+    {
+      "path": "/api/cron/content",
+      "schedule": "5 * * * *"
+    },
+    {
+      "path": "/api/cron/email-dispatch",
+      "schedule": "*/5 * * * *"
     }
   ],
   "functions": {
@@ -11,6 +19,15 @@
       "maxDuration": 300
     },
     "src/app/admin/finances/invoices/[id]/pdf/route.ts": {
+      "maxDuration": 30
+    },
+    "src/app/api/cron/content/route.ts": {
+      "maxDuration": 120
+    },
+    "src/app/api/cron/email-dispatch/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/webhooks/resend/route.ts": {
       "maxDuration": 30
     }
   }

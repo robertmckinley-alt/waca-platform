@@ -279,3 +279,120 @@ export const contactFieldTypeEnum = pgEnum("contact_field_type", [
   "phone",
   "url",
 ]);
+
+/* --------------------------------------------------------------- content */
+
+/**
+ * The editable collections. These mirror the public Astro site's content
+ * collections one-for-one (`waca-web/src/content.config.ts`) plus the three
+ * data-file shapes it reads from `src/data/` (`stat`, `nav`, `setting`).
+ *
+ * This is an ENUM and not a free-text column on purpose. On an advocacy site
+ * the taxonomy is editorial policy: adding a content type is a deliberate
+ * migration, not something a typo in an admin form can invent. It is the same
+ * stance the public site takes on its own frontmatter vocabularies.
+ */
+export const contentTypeKeyEnum = pgEnum("content_type_key", [
+  "page",
+  "press",
+  "record",
+  "agenda",
+  "post",
+  "person",
+  "member",
+  "stat",
+  "nav",
+  "setting",
+]);
+
+/**
+ * Editorial workflow.
+ *   draft      -- being written, invisible to the build
+ *   in_review  -- awaiting a second pair of eyes
+ *   scheduled  -- approved, waiting for publish_at
+ *   published  -- in the snapshot at /api/content/*
+ *   archived   -- withdrawn; kept for the record, never served
+ *
+ * Underscored rather than kebab-cased, matching the strings the CMS editor
+ * and the module agents were specified against.
+ */
+export const contentStatusEnum = pgEnum("content_status", [
+  "draft",
+  "in_review",
+  "scheduled",
+  "published",
+  "archived",
+]);
+
+/** Outcome of one "Publish" run -- one Vercel deploy-hook call. */
+export const contentPublishStatusEnum = pgEnum("content_publish_status", [
+  "queued",
+  "dispatched",
+  "succeeded",
+  "failed",
+]);
+
+/* ----------------------------------------------------------------- email */
+
+/**
+ * What KIND of mail this is. Drives category-scoped unsubscribes: a member who
+ * unsubscribes from `fundraising` must still receive `membership` mail about
+ * their own renewal, and no send may quietly reclassify itself to escape a
+ * suppression.
+ */
+export const emailCategoryEnum = pgEnum("email_category", [
+  "newsletter",
+  "policy-alert",
+  "event",
+  "membership",
+  "council",
+  "fundraising",
+  "general",
+]);
+
+/**
+ * Campaign lifecycle.
+ *
+ * The transition into 'sending' is guarded by a CHECK constraint AND a
+ * trigger -- see `campaigns` in schema/email.ts and migration 0006. Nothing
+ * reaches 'sending' without a named human approver and a live confirmation
+ * token.
+ */
+export const campaignStatusEnum = pgEnum("campaign_status", [
+  "draft",
+  "ready",
+  "scheduled",
+  "sending",
+  "sent",
+  "paused",
+  "cancelled",
+  "failed",
+]);
+
+/** Per-recipient delivery state, driven by provider webhooks. */
+export const campaignRecipientStatusEnum = pgEnum("campaign_recipient_status", [
+  "pending",
+  "sent",
+  "delivered",
+  "opened",
+  "clicked",
+  "bounced",
+  "complained",
+  "unsubscribed",
+  "suppressed",
+  "failed",
+]);
+
+/** Why an address is on the global suppression list. */
+export const suppressionReasonEnum = pgEnum("suppression_reason", [
+  "unsubscribed",
+  "bounced",
+  "complained",
+  "manual",
+]);
+
+/** How wide an unsubscribe link's effect is. */
+export const unsubscribeScopeEnum = pgEnum("unsubscribe_scope", [
+  "all",
+  "category",
+]);

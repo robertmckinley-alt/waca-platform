@@ -31,6 +31,59 @@ export default async function globalTeardown() {
       console.log(`[e2e] cleaned up ${docIds.length} test document(s)`);
     }
 
+    // CMS rows created by 06-cms.spec.ts. Scoped by slug prefix; revisions
+    // and the revision sequence go first because both point at the item.
+    const cmsItems = await sql<{ id: string }[]>`
+      select id from content_items where slug like 'e2e-%'`;
+    if (cmsItems.length) {
+      const cmsIds = cmsItems.map((i) => i.id);
+      // A publish run records the ids it promoted. Strip them out rather than
+      // deleting the run: the publish log is an audit trail, and a run that
+      // happened should keep saying so.
+      await sql`
+        update content_publishes
+           set item_ids = (
+                 select coalesce(array_agg(x), '{}')
+                   from unnest(item_ids) x
+                  where x <> all(${cmsIds}::uuid[]))
+         where item_ids && ${cmsIds}::uuid[]`;
+      // status and published_revision_id move together: CHECK
+      // content_items_published_needs_revision refuses a 'published' row with
+      // no revision, so clearing one without the other fails. The journey
+      // spec publishes what it creates, which is how that was found.
+      await sql`
+        update content_items
+           set published_revision_id = null, status = 'draft'
+         where id = any(${cmsIds}::uuid[])`;
+      await sql`delete from content_revisions where item_id = any(${cmsIds}::uuid[])`;
+      await sql`delete from content_revision_sequences where item_id = any(${cmsIds}::uuid[])`;
+      await sql`delete from content_items where id = any(${cmsIds}::uuid[])`;
+      console.log(`[e2e] cleaned up ${cmsIds.length} test content item(s)`);
+    }
+
+    /* Email rows created by 07-journeys.spec.ts. Recipients first (they point
+     * at the campaign), then the campaign, then the audience — and the
+     * unsubscribe tokens the dry-run dispatch minted per recipient, which
+     * belong to that campaign and to nothing else. */
+    const journeyCampaigns = await sql<{ id: string }[]>`
+      select id from campaigns where name like 'E2E journey campaign %'`;
+    if (journeyCampaigns.length) {
+      const ids = journeyCampaigns.map((c) => c.id);
+      await sql`delete from email_events where campaign_id = any(${ids}::uuid[])`;
+      await sql`delete from unsubscribe_tokens where campaign_id = any(${ids}::uuid[])`;
+      await sql`delete from campaign_recipients where campaign_id = any(${ids}::uuid[])`;
+      await sql`delete from suppressions where campaign_id = any(${ids}::uuid[])`;
+      await sql`delete from campaigns where id = any(${ids}::uuid[])`;
+      console.log(`[e2e] cleaned up ${ids.length} test campaign(s)`);
+    }
+    const journeyAudiences = await sql<{ id: string }[]>`
+      select id from audiences where name like 'E2E journey audience %'`;
+    if (journeyAudiences.length) {
+      const ids = journeyAudiences.map((a) => a.id);
+      await sql`delete from audience_members where audience_id = any(${ids}::uuid[])`;
+      await sql`delete from audiences where id = any(${ids}::uuid[])`;
+    }
+
     const events = await sql<{ id: string }[]>`
       select id from events where name like 'E2E %'`;
     if (events.length === 0) return;

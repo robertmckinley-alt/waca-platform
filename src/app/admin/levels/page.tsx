@@ -20,7 +20,7 @@ import {
   THead,
   TR,
 } from "@/components/ui/table";
-import { humanize } from "@/lib/format";
+import { humanize, moneyPlain } from "@/lib/format";
 import { setAllAutoRenewDefaults, updateMembershipLevel } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -196,7 +196,7 @@ export default async function LevelsPage() {
                     type="number"
                     step="0.01"
                     min="0"
-                    defaultValue={(level.feeCents / 100).toFixed(2)}
+                    defaultValue={moneyPlain(level.feeCents)}
                   />
                 </Field>
                 <Field label="Billing period" htmlFor={`billing-${level.id}`}>

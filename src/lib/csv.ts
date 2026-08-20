@@ -1,3 +1,4 @@
+import { moneyPlain } from "@/lib/finance/money";
 /**
  * CSV export. Every admin list view offers one, and they all go through here
  * so quoting and the filename convention stay identical.
@@ -40,11 +41,12 @@ export function csvResponse(csv: string, filenameStem: string): Response {
   });
 }
 
-/** Cents -> a plain decimal string so spreadsheets treat it as a number. */
-export function csvCents(cents: number | null | undefined): string {
-  if (cents === null || cents === undefined) return "";
-  return (Number(cents) / 100).toFixed(2);
-}
+/**
+ * Cents -> a plain decimal string so spreadsheets treat it as a number.
+ * `moneyPlain` from THE formatter — a CSV that disagreed with the screen it
+ * was exported from would be a bookkeeping problem, not a formatting one.
+ */
+export const csvCents = moneyPlain;
 
 export function csvDate(value: Date | string | null | undefined): string {
   if (!value) return "";

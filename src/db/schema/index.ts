@@ -14,6 +14,8 @@ export * from "./events";
 export * from "./finance";
 export * from "./documents";
 export * from "./audit";
+export * from "./content";
+export * from "./email";
 
 import { relations } from "drizzle-orm";
 import { accounts, sessions, users } from "./auth";
@@ -39,6 +41,23 @@ import {
   payments,
   refunds,
 } from "./finance";
+import {
+  contentAssets,
+  contentItems,
+  contentPublishes,
+  contentRevisions,
+  contentTypes,
+} from "./content";
+import {
+  audienceMembers,
+  audiences,
+  campaignRecipients,
+  campaigns,
+  emailEvents,
+  emailTemplates,
+  suppressions,
+  unsubscribeTokens,
+} from "./email";
 import {
   membershipApplications,
   membershipLevels,
@@ -412,3 +431,163 @@ export const documentDownloadsRelations = relations(
 );
 
 export const contactFieldsRelations = relations(contactFields, () => ({}));
+
+/* ------------------------------------------------------------- content */
+
+export const contentTypesRelations = relations(contentTypes, ({ many }) => ({
+  items: many(contentItems),
+}));
+
+export const contentItemsRelations = relations(
+  contentItems,
+  ({ one, many }) => ({
+    contentType: one(contentTypes, {
+      fields: [contentItems.type],
+      references: [contentTypes.key],
+    }),
+    revisions: many(contentRevisions),
+    createdByUser: one(users, {
+      fields: [contentItems.createdBy],
+      references: [users.id],
+      relationName: "contentItemCreatedBy",
+    }),
+    updatedByUser: one(users, {
+      fields: [contentItems.updatedBy],
+      references: [users.id],
+      relationName: "contentItemUpdatedBy",
+    }),
+  }),
+);
+
+export const contentRevisionsRelations = relations(
+  contentRevisions,
+  ({ one }) => ({
+    item: one(contentItems, {
+      fields: [contentRevisions.itemId],
+      references: [contentItems.id],
+    }),
+    author: one(users, {
+      fields: [contentRevisions.authorUserId],
+      references: [users.id],
+    }),
+  }),
+);
+
+export const contentAssetsRelations = relations(contentAssets, ({ one }) => ({
+  uploadedByUser: one(users, {
+    fields: [contentAssets.uploadedBy],
+    references: [users.id],
+  }),
+}));
+
+export const contentPublishesRelations = relations(
+  contentPublishes,
+  ({ one }) => ({
+    triggeredByUser: one(users, {
+      fields: [contentPublishes.triggeredBy],
+      references: [users.id],
+    }),
+  }),
+);
+
+/* --------------------------------------------------------------- email */
+
+export const audiencesRelations = relations(audiences, ({ many }) => ({
+  members: many(audienceMembers),
+  campaigns: many(campaigns),
+}));
+
+export const audienceMembersRelations = relations(
+  audienceMembers,
+  ({ one }) => ({
+    audience: one(audiences, {
+      fields: [audienceMembers.audienceId],
+      references: [audiences.id],
+    }),
+    contact: one(contacts, {
+      fields: [audienceMembers.contactId],
+      references: [contacts.id],
+    }),
+  }),
+);
+
+export const emailTemplatesRelations = relations(
+  emailTemplates,
+  ({ many }) => ({
+    campaigns: many(campaigns),
+  }),
+);
+
+export const campaignsRelations = relations(campaigns, ({ one, many }) => ({
+  template: one(emailTemplates, {
+    fields: [campaigns.templateId],
+    references: [emailTemplates.id],
+  }),
+  audience: one(audiences, {
+    fields: [campaigns.audienceId],
+    references: [audiences.id],
+  }),
+  recipients: many(campaignRecipients),
+  events: many(emailEvents),
+  approver: one(users, {
+    fields: [campaigns.approvedBy],
+    references: [users.id],
+    relationName: "campaignApprovedBy",
+  }),
+  creator: one(users, {
+    fields: [campaigns.createdBy],
+    references: [users.id],
+    relationName: "campaignCreatedBy",
+  }),
+}));
+
+export const campaignRecipientsRelations = relations(
+  campaignRecipients,
+  ({ one, many }) => ({
+    campaign: one(campaigns, {
+      fields: [campaignRecipients.campaignId],
+      references: [campaigns.id],
+    }),
+    contact: one(contacts, {
+      fields: [campaignRecipients.contactId],
+      references: [contacts.id],
+    }),
+    events: many(emailEvents),
+  }),
+);
+
+export const emailEventsRelations = relations(emailEvents, ({ one }) => ({
+  campaign: one(campaigns, {
+    fields: [emailEvents.campaignId],
+    references: [campaigns.id],
+  }),
+  recipient: one(campaignRecipients, {
+    fields: [emailEvents.recipientId],
+    references: [campaignRecipients.id],
+  }),
+}));
+
+export const suppressionsRelations = relations(suppressions, ({ one }) => ({
+  contact: one(contacts, {
+    fields: [suppressions.contactId],
+    references: [contacts.id],
+  }),
+  campaign: one(campaigns, {
+    fields: [suppressions.campaignId],
+    references: [campaigns.id],
+  }),
+}));
+
+export const unsubscribeTokensRelations = relations(
+  unsubscribeTokens,
+  ({ one }) => ({
+    contact: one(contacts, {
+      fields: [unsubscribeTokens.contactId],
+      references: [contacts.id],
+    }),
+    campaign: one(campaigns, {
+      fields: [unsubscribeTokens.campaignId],
+      references: [campaigns.id],
+    }),
+  }),
+);

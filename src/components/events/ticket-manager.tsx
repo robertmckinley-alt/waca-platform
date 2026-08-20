@@ -22,6 +22,7 @@ import {
 } from "@/lib/events/actions";
 import { toDateTimeLocal } from "@/lib/events/format";
 import { TICKET_TYPE_PRESETS } from "@/lib/events/presets";
+import { moneyPlain } from "@/lib/finance/money";
 
 export interface TicketRow {
   id: string;
@@ -63,7 +64,8 @@ const BLANK: TicketRow = {
   total: 0,
 };
 
-const dollars = (cents: number) => (cents / 100).toFixed(2);
+/** THE formatter. A form default and a table cell agree because of this. */
+const dollars = moneyPlain;
 
 /**
  * Ticket types CRUD, with the real WACA vocabulary as one-click presets.

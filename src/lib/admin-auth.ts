@@ -37,3 +37,20 @@ export async function isAdmin(): Promise<boolean> {
   const session = await auth();
   return session?.user?.role === "admin";
 }
+
+/**
+ * THE staff predicate, in the one form a route can ask without being thrown
+ * out of.
+ *
+ * `requireStaff()` throws, which is right for a mutation and wrong for
+ * /api/content/preview, where "not staff" is not a failure — it is the branch
+ * that goes on to check the signed preview token. That route had
+ * `role === "admin" || role === "staff"` written out inline, which is a second
+ * definition of who staff are, and the sort that stays behind when the first
+ * one gains a third role.
+ */
+export async function isStaffSession(): Promise<boolean> {
+  const session = await auth();
+  const role = session?.user?.role;
+  return role === "admin" || role === "staff";
+}

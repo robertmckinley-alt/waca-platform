@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { slugify as sharedSlugify } from "@/lib/slug";
 import {
   EVENT_KINDS,
   EVENT_STATUSES,
@@ -57,15 +58,9 @@ const checkbox = z.preprocess(
   z.boolean(),
 );
 
+/** THE slugifier, capped at the events table's slug length. */
 export function slugify(input: string) {
-  return input
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[^\w\s-]/g, "")
-    .trim()
-    .replace(/[\s_]+/g, "-")
-    .replace(/-+/g, "-")
-    .slice(0, 80);
+  return sharedSlugify(input, 80);
 }
 
 /* --------------------------------------------------------------- event */

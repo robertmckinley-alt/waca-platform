@@ -1,8 +1,9 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useId } from "react";
 import { useFormStatus } from "react-dom";
 import { cn } from "@/lib/cn";
+import { buttonClass, type ButtonVariant } from "./button";
 import { IDLE_STATE, type ActionState } from "@/lib/action-state";
 
 /**
@@ -48,41 +49,83 @@ export function ActionForm({
   );
 }
 
+/**
+ * THE submit button. One implementation.
+ *
+ * Four things were forked out of it while the CMS and the email tool were
+ * built in parallel — the media-library upload button, the archive toggle,
+ * the revision restore, the deploy retry and the send-approval button — each
+ * because it wanted ONE thing this did not have: to be disabled for a reason,
+ * and to say the reason. So the reason lives here now.
+ *
+ * `blockedBecause` is not decoration. A button that is disabled and silent is
+ * an accessibility defect and a support call: the control announces itself
+ * through aria-describedby, so a screen reader reaches the explanation from
+ * the button rather than having to hunt the page for it.
+ *
+ * NOTHING HERE IS A SECURITY CONTROL. `disabled` is a courtesy to the person
+ * at the keyboard. Every server action re-derives its own answer.
+ */
 export function SubmitButton({
   children,
   variant = "primary",
   name,
   value,
   confirm,
+  disabled = false,
+  blockedBecause = null,
+  pendingLabel = "Working…",
+  className,
+  id,
 }: {
   children: React.ReactNode;
-  variant?: "primary" | "secondary" | "danger";
+  variant?: ButtonVariant;
   name?: string;
   value?: string;
   confirm?: string;
+  /** Disable for a reason the user can act on. Never the security control. */
+  disabled?: boolean;
+  /** Why it is disabled. Rendered under the button and wired to it by id. */
+  blockedBecause?: string | null;
+  pendingLabel?: string;
+  className?: string;
+  id?: string;
 }) {
   const { pending } = useFormStatus();
-  return (
+  const reactId = useId();
+  const buttonId = id ?? reactId;
+  const reasonId = `${buttonId}-reason`;
+  const showReason = Boolean(blockedBecause) && disabled;
+
+  const button = (
     <button
+      id={buttonId}
       type="submit"
       name={name}
       value={value}
-      disabled={pending}
+      disabled={pending || disabled}
+      aria-describedby={showReason ? reasonId : undefined}
       onClick={(e) => {
         if (confirm && !window.confirm(confirm)) e.preventDefault();
       }}
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded border px-2.5 py-1.5 text-[12px] font-medium disabled:opacity-50",
-        variant === "primary" &&
-          "border-zinc-900 bg-zinc-900 text-white hover:bg-zinc-800",
-        variant === "secondary" &&
-          "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50",
-        variant === "danger" &&
-          "border-red-200 bg-white text-red-700 hover:bg-red-50",
-      )}
+      // buttonClass, not a second class string. The forks this replaced had
+      // each dropped the focus-visible ring on the way past, which is a 2.4.7
+      // failure for the only affordance a keyboard user has.
+      className={buttonClass(variant, "sm", cn("w-fit", className))}
     >
-      {pending ? "Working…" : children}
+      {pending ? pendingLabel : children}
     </button>
+  );
+
+  if (!showReason) return button;
+
+  return (
+    <span className="flex flex-col gap-1">
+      {button}
+      <span id={reasonId} className="text-[11px] text-amber-800">
+        {blockedBecause}
+      </span>
+    </span>
   );
 }
 

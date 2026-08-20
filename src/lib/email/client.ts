@@ -1,33 +1,27 @@
-import { Resend } from "resend";
+import { deliveryStatus, emailIsConfigured } from "./config";
+import { sendOne, type OutboundMessage } from "./transport";
 
 /**
  * ===========================================================================
- *  TRANSACTIONAL EMAIL — one send path, one guard.
+ *  THE LEGACY SEND SHIM.
  *
- *  THE GUARD: with no RESEND_API_KEY the app must still build, boot and run.
- *  Every send falls back to logging the fully rendered message to the console
- *  instead of throwing, so a developer with an empty .env.local sees exactly
- *  what a member would have received. `npm run build` passes with no key set,
- *  and that is a requirement, not a nicety.
+ *  `sendEmail()` predates the delivery module and several call sites still
+ *  use it — the campaign test send in particular. It is kept, with its
+ *  signature unchanged, but it is now a THIN WRAPPER over `sendOne()` in
+ *  transport.ts. That matters: it means the dry-run gate applies to it too,
+ *  and there is genuinely one place in this repository that talks to a mail
+ *  provider rather than two that mostly agree.
  *
- *  A send failure is logged and swallowed. A bounced receipt must never roll
- *  back the payment it was confirming.
+ *  WHAT MOVED OUT. `layout()` and `detailRows()` used to live here and built
+ *  transactional HTML by string concatenation — a second email system beside
+ *  the block renderer, with its own Outlook bugs and its own idea of what a
+ *  footer is. They are gone. Transactional mail is now blocks, rendered by
+ *  the same renderer as a newsletter: see src/lib/email/transactional.ts.
  *
- *  NO CARD PROCESSING: no template in this directory contains a "pay now"
- *  link, a card form, or a hosted checkout URL, because there is nothing to
- *  link to. Every money template points at the offline remittance details.
+ *  `escapeHtml` stays here because the renderer and the merge both import it
+ *  from this path, and moving it would churn files this module does not own.
  * ===========================================================================
  */
-
-const apiKey = process.env.RESEND_API_KEY ?? process.env.AUTH_RESEND_KEY;
-const from = process.env.EMAIL_FROM ?? "WACA <no-reply@example.org>";
-
-let client: Resend | null = null;
-function resend(): Resend | null {
-  if (!apiKey) return null;
-  client ??= new Resend(apiKey);
-  return client;
-}
 
 export interface RenderedEmail {
   subject: string;
@@ -36,67 +30,69 @@ export interface RenderedEmail {
 }
 
 export interface SendResult {
+  /** True only when a message actually reached the provider. */
   delivered: boolean;
   providerMessageId?: string | null;
-  reason?: "no-api-key" | "no-recipient" | "send-failed";
+  reason?: "no-api-key" | "no-recipient" | "send-failed" | "dry-run";
   error?: string;
+  /** Why nothing was transmitted, when nothing was. */
+  dryRunReasons?: string[];
 }
 
+/**
+ * Send one already-rendered message.
+ *
+ * NEVER THROWS, and a failure is never fatal to the caller: a bounced receipt
+ * must not roll back the payment it was confirming.
+ *
+ * In dry run — no API key, EMAIL_DRY_RUN, or demo data — the fully rendered
+ * plain-text part is printed to the server console and `delivered` is false
+ * with `reason: "dry-run"`. Callers that treat "not delivered" as an error
+ * should check `reason` first; a dry run is the documented local mode, not a
+ * fault.
+ */
 export async function sendEmail(
   to: string | null | undefined,
   email: RenderedEmail,
-  opts: { replyTo?: string; attachments?: { filename: string; content: Buffer }[] } = {},
+  opts: {
+    replyTo?: string;
+    attachments?: { filename: string; content: Buffer }[];
+    headers?: Record<string, string>;
+    idempotencyKey?: string;
+  } = {},
 ): Promise<SendResult> {
   if (!to) {
     console.warn(`[email:skipped] no recipient for "${email.subject}"`);
     return { delivered: false, reason: "no-recipient" };
   }
 
-  const c = resend();
-  if (!c) {
-    console.info(
-      [
-        "──────────────────────────────────────────────────────────────",
-        `[email:disabled] RESEND_API_KEY is not set — nothing was sent.`,
-        `To:      ${to}`,
-        `Subject: ${email.subject}`,
-        "──────────────────────────────────────────────────────────────",
-        email.text,
-        "──────────────────────────────────────────────────────────────",
-      ].join("\n"),
-    );
-    return { delivered: false, reason: "no-api-key" };
-  }
+  const message: OutboundMessage = {
+    to,
+    subject: email.subject,
+    html: email.html,
+    text: email.text,
+    replyTo: opts.replyTo,
+    attachments: opts.attachments,
+    headers: opts.headers,
+    idempotencyKey: opts.idempotencyKey,
+  };
 
-  try {
-    const result = await c.emails.send({
-      from,
-      to,
-      subject: email.subject,
-      html: email.html,
-      text: email.text,
-      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
-      ...(opts.attachments?.length
-        ? {
-            attachments: opts.attachments.map((a) => ({
-              filename: a.filename,
-              content: a.content,
-            })),
-          }
-        : {}),
-    });
-    return { delivered: true, providerMessageId: result.data?.id ?? null };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[email:failed] "${email.subject}" to ${to}: ${message}`);
-    return { delivered: false, reason: "send-failed", error: message };
-  }
+  const result = await sendOne(message);
+  const status = deliveryStatus();
+
+  return {
+    delivered: result.transmitted,
+    providerMessageId: result.providerMessageId,
+    reason:
+      result.reason === "dry-run"
+        ? "dry-run"
+        : (result.reason as SendResult["reason"]),
+    error: result.error,
+    ...(result.reason === "dry-run" ? { dryRunReasons: status.reasons } : {}),
+  };
 }
 
-/** True when a key is configured. Lets a UI say "email is not wired up yet". */
-export function emailIsConfigured(): boolean {
-  return Boolean(apiKey);
-}
+export { emailIsConfigured };
 
 export function escapeHtml(value: string): string {
   return value.replace(
@@ -110,39 +106,4 @@ export function escapeHtml(value: string): string {
         "'": "&#39;",
       })[c]!,
   );
-}
-
-/**
- * The shell every WACA email sits in. Table-free, inline-styled, and plain
- * enough to survive Outlook — no framework, because a transactional email is
- * six paragraphs and a table.
- */
-export function layout(body: string, footNote?: string): string {
-  return `<!doctype html>
-<html><body style="margin:0;padding:24px;background:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;color:#18181b;line-height:1.55">
-  <div style="max-width:600px;margin:0 auto;background:#fff;border:1px solid #e4e4e7;border-radius:6px;overflow:hidden">
-    <div style="background:#18181b;color:#fff;padding:16px 24px">
-      <div style="font-size:15px;font-weight:600;letter-spacing:-0.01em">Washington CannaBusiness Association</div>
-      <div style="font-size:11px;color:#a1a1aa;margin-top:2px">PO Box 3329, Kirkland, WA 98083-3329</div>
-    </div>
-    <div style="padding:24px;font-size:14px">${body}</div>
-    <div style="border-top:1px solid #e4e4e7;padding:14px 24px;font-size:11px;color:#71717a">
-      ${footNote ? `${escapeHtml(footNote)}<br/>` : ""}
-      WACA does not accept card payments. Invoices are settled by cheque, ACH or bank transfer.
-    </div>
-  </div>
-</body></html>`;
-}
-
-/** A money/detail table, rendered the same way in every template. */
-export function detailRows(rows: [string, string][]): string {
-  return `<table cellpadding="0" cellspacing="0" style="width:100%;font-size:13px;margin:14px 0;border-collapse:collapse">
-  ${rows
-    .map(
-      ([label, value]) =>
-        `<tr><td style="padding:4px 12px 4px 0;color:#71717a;white-space:nowrap">${escapeHtml(label)}</td>
-             <td style="padding:4px 0;text-align:right;font-variant-numeric:tabular-nums">${escapeHtml(value)}</td></tr>`,
-    )
-    .join("")}
-</table>`;
 }

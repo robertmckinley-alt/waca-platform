@@ -1,7 +1,7 @@
 import { asc, eq, sql } from "drizzle-orm";
 import { db as defaultDb, type DbExecutor } from "@/db";
 import { contacts, invoiceLines, invoices, organizations } from "@/db/schema";
-import { sendEmail, type SendResult } from "@/lib/email/client";
+import { sendTransactional, type TransactionalResult } from "@/lib/email/transactional";
 import {
   invoiceSent,
   paymentReceived,
@@ -33,6 +33,20 @@ import {
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
 
+/** Nothing to send to. Shaped like every other result so a caller never has
+ *  to branch on whether the lookup found a row. */
+const NO_RECIPIENT: TransactionalResult = {
+  transmitted: false,
+  mode: "dry-run",
+  providerMessageId: null,
+  attempts: 0,
+  reason: "no-recipient",
+  tookMs: 0,
+  to: null,
+  blocked: null,
+  rendered: null,
+};
+
 /* ===================================================================== */
 /*  Invoice sent                                                         */
 /* ===================================================================== */
@@ -41,7 +55,7 @@ const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
 export async function emailInvoice(
   invoiceId: string,
   opts: { db?: DbExecutor; to?: string | null } = {},
-): Promise<SendResult & { to: string | null }> {
+): Promise<TransactionalResult> {
   const database = opts.db ?? defaultDb;
 
   const [row] = await database
@@ -57,7 +71,7 @@ export async function emailInvoice(
     .where(eq(invoices.id, invoiceId))
     .limit(1);
 
-  if (!row) return { delivered: false, reason: "no-recipient", to: null };
+  if (!row) return NO_RECIPIENT;
 
   const lines = await database
     .select()
@@ -77,9 +91,15 @@ export async function emailInvoice(
     row.organizationName ??
     "there";
 
-  const result = await sendEmail(
+  const result = await sendTransactional({
     to,
-    invoiceSent({
+    kind: "invoice",
+    category: "membership",
+    // STABLE: a retried server action must not send a second copy of the
+    // same invoice. Resend collapses the duplicate on this key.
+    idempotencyKey: `waca-invoice-${invoiceId}`,
+    db: opts.db,
+    ...invoiceSent({
       invoiceNumber: row.invoice.number,
       recipientName,
       organizationName: row.organizationName,
@@ -97,9 +117,9 @@ export async function emailInvoice(
       })),
       pdfUrl: `${APP_URL}/admin/finances/invoices/${invoiceId}/pdf`,
     }),
-  );
+  });
 
-  return { ...result, to: to ?? null };
+  return result;
 }
 
 /* ===================================================================== */
@@ -115,7 +135,7 @@ export interface PaymentReceiptInput {
 /** Emails a receipt for a recorded payment. Never throws. */
 export async function emailPaymentReceipt(
   input: PaymentReceiptInput,
-): Promise<SendResult & { to: string | null }> {
+): Promise<TransactionalResult> {
   const database = input.db ?? defaultDb;
 
   const rows = (await database.execute(sql`
@@ -158,13 +178,17 @@ export async function emailPaymentReceipt(
   }[];
 
   const row = rows?.[0];
-  if (!row) return { delivered: false, reason: "no-recipient", to: null };
+  if (!row) return NO_RECIPIENT;
 
   const to = input.to ?? row.contactEmail;
 
-  const result = await sendEmail(
+  const result = await sendTransactional({
     to,
-    paymentReceived({
+    kind: "receipt",
+    category: "membership",
+    idempotencyKey: `waca-receipt-${input.paymentId}`,
+    db: input.db,
+    ...paymentReceived({
       recipientName: row.contactName ?? row.organizationName ?? "there",
       organizationName: row.organizationName,
       amountCents: Number(row.amountCents),
@@ -178,9 +202,9 @@ export async function emailPaymentReceipt(
         balanceCents: Number(a.balanceCents),
       })),
     }),
-  );
+  });
 
-  return { ...result, to: to ?? null };
+  return result;
 }
 
 /* ===================================================================== */
@@ -248,9 +272,14 @@ export async function dispatchRenewalReminders(
       continue;
     }
 
-    const result = await sendEmail(
-      reminder.contactEmail,
-      renewalReminder(tone, {
+    const result = await sendTransactional({
+      to: reminder.contactEmail,
+      kind: "renewal",
+      category: "membership",
+      // One reminder row = one message, however many times the dispatcher runs.
+      idempotencyKey: `waca-reminder-${reminder.reminderId}`,
+      db: database,
+      ...renewalReminder(tone, {
         recipientName: reminder.contactName ?? reminder.organizationName,
         organizationName: reminder.organizationName,
         levelName: reminder.levelName,
@@ -261,25 +290,38 @@ export async function dispatchRenewalReminders(
         autoRenew: reminder.autoRenew,
         portalUrl: `${APP_URL}/portal`,
       }),
-    );
+    });
 
-    // "No API key" is not a failure — it is the documented local mode. The
-    // reminder is still marked sent so the ladder advances in a dev database
-    // exactly as it would in production.
-    const status: "sent" | "failed" =
-      result.delivered || result.reason === "no-api-key" ? "sent" : "failed";
+    /* A DRY RUN IS NOT A FAILURE — it is the documented mode with no API
+     * key, with EMAIL_DRY_RUN set, or while the database is demo data. The
+     * reminder is marked sent so the ladder advances in a rehearsal exactly
+     * as it would in production, and the recorded provider id begins
+     * `dry-run:` so the trail says plainly that nothing was transmitted.
+     *
+     * A message the SUPPRESSION LIST stopped is not a failure either: the
+     * address hard-bounced or complained, the reminder has been handled as
+     * far as email can handle it, and leaving it queued for ever would hide
+     * the fact. It is marked skipped, with the reason on the row. */
+    const status: "sent" | "failed" | "skipped" = result.blocked
+      ? "skipped"
+      : result.transmitted || result.reason === "dry-run"
+        ? "sent"
+        : "failed";
 
     await markReminder(
       reminder.reminderId,
       {
         status,
         providerMessageId: result.providerMessageId,
-        error: result.error ?? null,
+        error: result.blocked
+          ? `Address suppressed (${result.blocked}). Reach this member another way.`
+          : (result.error ?? null),
       },
       { db: database },
     );
 
     if (status === "sent") sent += 1;
+    else if (status === "skipped") skipped += 1;
     else failed += 1;
 
     details.push({
@@ -289,7 +331,9 @@ export async function dispatchRenewalReminders(
       templateKey: reminder.templateKey,
       tone,
       status,
-      error: result.error,
+      error: result.blocked
+        ? `suppressed: ${result.blocked}`
+        : result.error,
     });
   }
 

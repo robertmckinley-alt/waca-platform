@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 
 import { db } from "@/db";
 import { renewalReminderRules } from "@/db/schema";
+import { deliveryStatus } from "@/lib/email";
 import { listMembershipLevels } from "@/db/queries";
 import {
   Badge,
@@ -46,6 +47,7 @@ export default async function SettingsPage() {
   ]);
 
   const autoRenewOff = levels.filter((l) => !l.autoRenewDefault);
+  const delivery = deliveryStatus();
 
   const integrations: {
     name: string;
@@ -58,11 +60,27 @@ export default async function SettingsPage() {
       detail: "Local Postgres 17 in this container. Supabase is not provisioned yet — see README.",
     },
     {
+      // ONE row for the whole email system — transactional AND campaigns —
+      // because there is one gate and one transport. `deliveryStatus()` is
+      // the authority; the key alone is not, since demo data or EMAIL_DRY_RUN
+      // force a dry run on their own.
       name: "Email (Resend)",
-      ready: envState("RESEND_API_KEY").set,
-      detail: envState("RESEND_API_KEY").set
-        ? "Transactional mail will send."
-        : "No RESEND_API_KEY. Mail is logged to the server console and never sent; a send failure never rolls back a registration or a payment.",
+      ready: delivery.transmitting,
+      detail: delivery.detail,
+    },
+    {
+      name: "Email webhooks",
+      ready: envState("RESEND_WEBHOOK_SECRET").set,
+      detail: envState("RESEND_WEBHOOK_SECRET").set
+        ? "/api/webhooks/resend is verifying signatures. Bounces and complaints reach the suppression list."
+        : "No RESEND_WEBHOOK_SECRET, so /api/webhooks/resend returns 503 and refuses every event. Nothing is ever recorded as delivered, opened, bounced or complained, and the suppression list stops growing. The endpoint is public and writes to a global block list, so it is never run unverified.",
+    },
+    {
+      name: "Scheduled email dispatch",
+      ready: envState("CRON_SECRET").set,
+      detail: envState("CRON_SECRET").set
+        ? "/api/cron/email-dispatch is armed. It can only dispatch campaigns a human already approved — it cannot approve anything."
+        : "No CRON_SECRET, so /api/cron/email-dispatch returns 503. A scheduled campaign will sit until somebody sends it by hand.",
     },
     {
       name: "Document storage",
