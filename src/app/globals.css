@@ -1,26 +1,94 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/*
+ * WACA platform base styles.
+ *
+ * Neutral, dense, high-contrast. The admin is a data tool: zinc greys, one
+ * accent used only for focus, and colour reserved for genuine status meaning
+ * (overdue, lapsed). No decorative colour anywhere.
+ */
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: var(--color-white);
+  color: var(--color-zinc-900);
+  font-family: var(--font-sans);
+  font-feature-settings: "tnum" 0;
+}
+
+/* Tabular figures everywhere money or a count is right-aligned. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-zinc-900);
+  outline-offset: 1px;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * MEMBER PORTAL
+ *
+ * The admin above is a data tool. The portal is member-facing and reads like
+ * the marketing site: serif headings, generous whitespace, hairline rules,
+ * left-aligned, no cards-with-shadows and no dashboard chrome. One accent
+ * (moss) used for links and the renewal call to action, nothing else.
+ * ---------------------------------------------------------------------------
+ */
+
+@theme {
+  --color-moss-50: #f2f6f3;
+  --color-moss-100: #e0eae3;
+  --color-moss-200: #c2d5c8;
+  --color-moss-600: #37634a;
+  --color-moss-700: #2a4f3a;
+  --color-moss-800: #1f3b2c;
+  --color-moss-900: #16301f;
+}
+
+@theme inline {
+  --font-serif: var(--font-portal-serif), ui-serif, Georgia, "Times New Roman",
+    serif;
+}
+
+/* Portal body copy: longer measure, looser leading than the admin. */
+.portal-copy {
+  max-width: 68ch;
+  line-height: 1.6;
+}
+
+/* Inline links inside portal prose. Underlined by default — never colour alone. */
+.portal-link {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+  text-decoration-color: var(--color-zinc-300);
+}
+.portal-link:hover {
+  text-decoration-color: var(--color-moss-700);
+  color: var(--color-moss-800);
+}
+
+/* Visible-on-focus skip link. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 50;
+}
+.skip-link:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+  background: var(--color-white);
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-zinc-900);
 }
